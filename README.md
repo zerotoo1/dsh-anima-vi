@@ -22,7 +22,7 @@ whether code is read aloud — all without touching `package.json` or
 - **Your own presets** — save the sliders as a preset, keep it next to the
   shipped ones, delete it when it is not needed.
 
-Repository: <https://github.com/ZEROTOOL/dsh-voice-v>
+Repository: <https://github.com/zerotoo1/dsh-voice-v>
 
 - **Host half** (`lib/index.js`) registers a `/dsh-voice-v` prefix route on the
   injected `webServer` Cordis service, synthesizes speech with the `edge-tts`
