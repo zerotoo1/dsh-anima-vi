@@ -1,0 +1,57 @@
+# dsh-voice-v bundle layer: inserts its own row into the web plugin roster.
+#
+# The single row mounts BOTH halves of the package:
+#   * the Host half (package root export, lib/index.js) registers the
+#     /dsh-voice-v/* HTTP routes on the injected `webServer` service and owns
+#     the plugin's schemastery `Config`, which is the settings form's schema;
+#   * the browser half (the "./client" export, lib/client.js) is attached by
+#     `@deepseek-ai/dsh-client-modules` to the Loader row whose module
+#     specifier (`name`) is the bare package name. It registers the speaker
+#     button into `conversation.chat.assistant-actions` and the configuration
+#     card into `plugins.bundle.config` (keyed by package name) — the seat the
+#     Plugins page declares for a bundle's own configuration, not the
+#     `plugins.item` list, which is the Official group. The card reads and
+#     writes through the shared form `ctx.configForms.get(entryId)`.
+#
+# IDENTITY: the row `id` IS the settings namespace. `@deepseek-ai/dsh-settings`
+# projects every live row as `ns: entry.options.id`, and a client card is
+# addressed by that same entry id (`ctx.configForms.get(entryId)`), so the
+# row id here, the Loader entry id and the card's form key must stay one
+# string: `dsh-voice-v`. There is no `settings.register(...)` call and no
+# client `settingsScope` service on this architecture — the form is derived
+# from this row's own `Config`, so `id` and `name` differ only in role:
+# `id` names the settings entry, `name` is the package specifier the client
+# module system attaches the browser half to. Both are 'dsh-voice-v'.
+#
+# This block is the LAYER OF DEFAULTS. The form's schema comes from the row's
+# own schemastery `Config` (lib/config.js); a `config` block here is that
+# form's base layer, the settings document carries the user layer, and a field
+# the user clears falls back to the base. Priority: user settings section >
+# this config block > the schema's own defaults.
+#
+# The block stays the place for deployment-only values, which the card never
+# shows and never writes (paths, limits, extra presets):
+#
+#   - id: dsh-voice-v
+#     name: 'dsh-voice-v'
+#     config:
+#       preset: zhivoy
+#       presets:
+#         moskovskiy: { rate: '+15%', pitch: '+30Hz' }
+#       voices:
+#         - de-DE-KatjaNeural
+#         - { id: en-US-JennyNeural, label: 'Дженни' }
+#       binPath: 'C:\...\edge-tts.exe'
+#       cacheDir: 'C:\...\cache'
+#       maxChunkChars: 320
+#       timeoutMs: 60000
+#       warmConcurrency: 2
+#
+# The card renders exactly the fields the row's `Config` schema declares — the
+# user-owned set in SETTINGS_FIELDS (lib/config.js: preset / rate / pitch /
+# voice / stripCode / autoPreset / dictionary / userPresets). Deployment-only
+# keys are declared outside that schema, so they stay composition state rather
+# than becoming editable.
+- insert:
+    - id: dsh-voice-v
+      name: 'dsh-voice-v'

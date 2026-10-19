@@ -1,0 +1,10 @@
+# The working backup of the original files — never published, never committed.
+.orig-backup/
+
+# A plugin is a plain folder: it is linked into a profile, never installed.
+node_modules/
+
+# The release archive is built outside the repository.
+*.zip
+
+*.log

@@ -1,0 +1,61 @@
+{
+  "name": "dsh-voice-v",
+  "version": "0.1.0",
+  "description": "Read-aloud speaker button under every assistant message in the DeepSeek Harness web GUI, voiced by edge-tts: seven Russian and multilingual voices, the narration preset picked from the tone of the message, and a spectrum inside the button while the voice plays. Ships a configuration card on the plugin's own page in the Plugins tab (presets, user presets, live sliders, pronunciation dictionary, code-stripping switch) projected from the plugin row's own schemastery Config.",
+  "author": "ZEROTOOL",
+  "license": "MIT",
+  "homepage": "https://github.com/ZEROTOOL/dsh-voice-v#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZEROTOOL/dsh-voice-v.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZEROTOOL/dsh-voice-v/issues"
+  },
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "tts",
+    "read-aloud",
+    "edge-tts",
+    "russian",
+    "plugin-config",
+    "speech",
+    "spectrum-visualizer",
+    "dsh"
+  ],
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "verify": "node scripts/build-client.mjs --check",
+    "test": "node test/synth.mjs && node test/settings.mjs",
+    "test:routes": "node test/synth.mjs",
+    "test:settings": "node test/settings.mjs"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}
