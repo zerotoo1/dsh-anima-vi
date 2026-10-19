@@ -478,7 +478,7 @@ are removed in a `finally`.
 From the repository:
 
 ```bash
-git clone https://github.com/ZEROTOOL/dsh-voice-v.git
+git clone https://github.com/zerotoo1/dsh-voice-v.git
 ```
 
 or take the release archive `dsh-voice-v-<version>.zip` and unpack it
