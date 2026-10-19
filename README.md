@@ -22,7 +22,7 @@ whether code is read aloud — all without touching `package.json` or
 - **Your own presets** — save the sliders as a preset, keep it next to the
   shipped ones, delete it when it is not needed.
 
-Repository: <https://github.com/zerotoo1/dsh-voice-v>
+Repository: <https://github.com/zerotoo1/dsh-anima-vi>
 
 - **Host half** (`lib/index.js`) registers a `/dsh-voice-v` prefix route on the
   injected `webServer` Cordis service, synthesizes speech with the `edge-tts`
@@ -135,6 +135,9 @@ Settings → Plugins → **Plugin configuration** → *Озвучка ответ
   never hides the voice in use.
 * **Визуализация** — see "The visualization inside the message button" below.
   On by default.
+* **Синтез речи** — the provider dropdown (`edge-tts` by default, or an
+  OpenAI-compatible endpoint) and, while the endpoint is chosen, its base URL,
+  its model id and its key. See "Custom TTS Providers" below.
 * **Сохранить / Отменить правки** — nothing is written until Save: the card
   stages the fields the user touched and sends one `scope.set` (or
   `scope.unset`) per field. A header note marks unsaved edits, and a namespace
@@ -178,6 +181,73 @@ A deployment extends or replaces the catalogue through the plugin row's
 The **user layer never owns the catalogue**: only the `voice` field itself is a
 user setting, and a voice the catalogue does not know is still honoured.
 
+## Custom TTS Providers
+
+`edge-tts` is the default and stays the default. The plugin speaks to a local
+CLI, needs no key and no network, and a deployment that configures nothing
+gets exactly the behaviour it had before this section existed — the same
+process, the same arguments, the same cache.
+
+A deployment that has keys of its own can point the plugin at an
+**OpenAI-compatible endpoint** instead. The card grows a group **«Синтез
+речи»** with four fields:
+
+| field | meaning |
+|---|---|
+| `ttsProvider` | `edge` (default) or `custom` |
+| `customBaseUrl` | the base URL, e.g. `https://api.openai.com/v1` |
+| `customApiKey` | the provider's key — a secret |
+| `customModel` | the model id, e.g. `tts-1` |
+
+The endpoint's own fields appear only while `custom` is selected. All four are
+ordinary settings: the **user layer owns them** and overrides the deployment
+layer, exactly like every other setting. The deployment layer may prefill
+them in the plugin row's `config` (`cordis.patch.yml`) — the key belongs in the
+profile's user layer and **never in the repository**.
+
+### The request
+
+```
+POST <base>/audio/speech
+Content-Type: application/json
+Authorization: Bearer <customApiKey>      ← only when a key is set
+
+{ "model": "<customModel>", "input": "<text>", "voice": "<voice>", "response_format": "mp3", "speed": 1.06 }
+```
+
+* the URL is the base URL with its trailing `/` trimmed; a base that already
+  ends with `/audio/speech` is used as it is, so a full endpoint URL is never
+  doubled;
+* `speed` is the tempo the plugin already had: `1 + rate/100` (`+6%` → `1.06`),
+  clamped to OpenAI's `[0.25, 4.0]`. A tempo nobody configured sends no
+  `speed` at all;
+* the answer's bytes are the MP3, and they land in the plugin's own cache — the
+  `/speak` flow, the audio route and the client cannot tell the two providers
+  apart;
+* a non-2xx answer fails with a message naming the status and the provider's
+  own error text. A network error or a timeout fails the same way. **The key
+  never appears in a log line, an error message, the cache key, or the
+  `/config` payload** — the payload reports `customApiKeySet: true|false` and
+  nothing more, and the card's password field starts empty.
+
+**`pitch` has no equivalent in the OpenAI API** and is ignored by the custom
+provider: the tone slider only shapes the edge-tts reading.
+
+The **voice id** is the provider's own id, not an edge-tts voice: pick **«Свой
+голос…»** in the voice dropdown and type it. The card says so while the custom
+provider is selected.
+
+### Providers that work
+
+| provider | base URL | model | voice id |
+|---|---|---|---|
+| OpenAI | `https://api.openai.com/v1` | `tts-1` (also `tts-1-hd`, `gpt-4o-mini-tts`) | `alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`, `marin`, `cedar` |
+| SiliconFlow | `https://api.siliconflow.cn/v1` | `FunAudioLLM/CosyVoice2-0.5B` | `FunAudioLLM/CosyVoice2-0.5B:anna` |
+| MiniMax | `https://api.minimax.io/v1` | `speech-02-hd` (also `speech-2.8-turbo`) | `English_expressive_narrator`, `female-shaonv` |
+
+All three speak the OpenAI `POST /v1/audio/speech` shape with `{ model, input,
+voice, response_format, speed }`.
+
 ## Playback: one voice at a time
 
 The browser half owns **one** sound slot for the whole page
@@ -208,7 +278,8 @@ the slot back.
 Only fields the namespace declares (`SETTINGS_FIELDS` in `lib/config.js`) can
 shadow the plugin row's config: **`preset`**, **`rate`**, **`pitch`**,
 **`voice`**, **`stripCode`**, **`autoPreset`**, **`dictionary`**,
-**`userPresets`**, **`spectrum`**. A
+**`userPresets`**, **`spectrum`**, **`ttsProvider`**, **`customBaseUrl`**,
+**`customApiKey`**, **`customModel`**. A
 hand-written key outside that set in the settings document is ignored, so the
 document cannot be used to smuggle a `binPath` or `cacheDir` override past the
 composition layer.
@@ -317,7 +388,7 @@ All six live under the `/dsh-voice-v` prefix registered on `ctx.webServer`.
 | Route | Behaviour |
 |---|---|
 | `GET /dsh-voice-v/health` | liveness, effective voice settings, and the `stripCode` state. No synthesis. |
-| `GET /dsh-voice-v/config` | resolved preset / voice / rate / pitch, the preset table (`presets`, the user's own `userPresets`, and the ordered `presetList`), the built-in `dictionaryDefaults`, the effective `dictionary`, the slider domains, the `stripCode` and `autoPreset` switches, the visualization (`spectrum` and the `spectrumVariants` the card renders), `settingsNamespace`, `settingsFields`, and `settingsRegistered`. No synthesis. |
+| `GET /dsh-voice-v/config` | resolved preset / voice / rate / pitch, the preset table (`presets`, the user's own `userPresets`, and the ordered `presetList`), the built-in `dictionaryDefaults`, the effective `dictionary`, the slider domains, the `stripCode` and `autoPreset` switches, the visualization (`spectrum` and the `spectrumVariants` the card renders), the synthesis provider (`ttsProvider`, `customBaseUrl`, `customModel` and `customApiKeySet` — the key itself is never sent), `settingsNamespace`, `settingsFields`, and `settingsRegistered`. No synthesis. |
 | `GET\|POST /dsh-voice-v/speak` | resolves the message text, cleans it, chunks it, synthesizes the **first** chunk, and returns the ordered part list. Reads the live settings. |
 | `GET\|POST /dsh-voice-v/preview` | synthesizes with the caller's own `text`/`preset`/`rate`/`pitch`/`voice`/`stripCode` and answers `audio/mpeg`. Reads no settings. |
 | `GET\|HEAD /dsh-voice-v/audio/<sha256>.mp3` | the cached MP3 for one part, with `Accept-Ranges` and single-range `206` support. |
@@ -456,6 +527,11 @@ any failure returns `null` instead of throwing.
   One MP3 per chunk; a hit is served straight from disk. Because the voice triple
   is part of the key, a changed setting lands in its own slot instead of reusing
   the previous reading.
+- The custom endpoint adds its own material to the key — the provider, the
+  model and the base URL — so an `edge-tts` file is never served for a custom
+  request, and the other way round. The API key is deliberately **not** part of
+  the key: a secret must never reach a file name, and replacing a key must not
+  re-synthesize everything.
 - Concurrent requests for the same chunk share one `edge-tts` process.
 - The answer is cleaned, then cut into sentence-aligned chunks of at most
   `maxChunkChars`. `/speak` synthesizes chunk 1 synchronously and warms the rest
@@ -478,17 +554,17 @@ are removed in a `finally`.
 From the repository:
 
 ```bash
-git clone https://github.com/zerotoo1/dsh-voice-v.git
+git clone https://github.com/zerotoo1/dsh-anima-vi.git
 ```
 
 or take the release archive `dsh-voice-v-<version>.zip` and unpack it
 anywhere. The plugin is a plain folder — it is never installed into
 `node_modules` by a package manager, it is linked.
 
-`C:\Users\ZEROTOOL\.dsh\profiles\web`:
+`~/.dsh/profiles/web`:
 
 1. **`package.json` → `dependencies`** — add
-   `"dsh-voice-v": "link:F:\\ZERO\\PROGRAMMS\\AI\\DSH_PLUGINS\\dsh-voice-v"`
+   `"dsh-voice-v": "link:path/to/your/plugin"`
    (or `"file:…"`, or the path of your clone), then let the profile's package
    manager materialise the link.
 2. **`package.json` → `dsh.profile.bundles`** — append `"dsh-voice-v"`.
@@ -540,7 +616,7 @@ output fails the suite too.
 To replay the id-addressed message lookup against a genuine transcript:
 
 ```powershell
-$env:DSH_VOICE_V_SESSION_FILE = "C:\Users\ZEROTOOL\.dsh\sessions\<project>\<session>\session.v4.jsonl.zstd"
+$env:DSH_VOICE_V_SESSION_FILE = "$HOME/.dsh/sessions/<project>/<session>/session.v4.jsonl.zstd"
 node test/synth.mjs
 ```
 

@@ -47,9 +47,28 @@
 #       timeoutMs: 60000
 #       warmConcurrency: 2
 #
+# The CUSTOM TTS ENDPOINT is the one exception: `ttsProvider`, `customBaseUrl`,
+# `customApiKey` and `customModel` are ordinary user settings (they are
+# volatile fields of the namespace schema, so the settings card owns them), and
+# the deployment layer may prefill them — the user layer overrides them, like
+# every other setting:
+#
+#   - id: dsh-voice-v
+#     name: 'dsh-voice-v'
+#     config:
+#       ttsProvider: custom
+#       customBaseUrl: 'https://api.openai.com/v1'
+#       customModel: 'tts-1'
+#       # customApiKey: 'sk-…'   ← a secret: keep it in the profile's user
+#       #                          layer, never in the repository.
+#
+# `ttsProvider` defaults to `edge`: without it, or without a base URL and a
+# model, the plugin speaks through the local `edge-tts` CLI exactly as before.
+#
 # The card renders exactly the fields the row's `Config` schema declares — the
 # user-owned set in SETTINGS_FIELDS (lib/config.js: preset / rate / pitch /
-# voice / stripCode / autoPreset / dictionary / userPresets). Deployment-only
+# voice / stripCode / autoPreset / dictionary / userPresets / spectrum /
+# ttsProvider / customBaseUrl / customApiKey / customModel). Deployment-only
 # keys are declared outside that schema, so they stay composition state rather
 # than becoming editable.
 - insert:

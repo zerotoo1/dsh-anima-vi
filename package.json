@@ -1,16 +1,16 @@
 {
   "name": "dsh-voice-v",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read-aloud speaker button under every assistant message in the DeepSeek Harness web GUI, voiced by edge-tts: seven Russian and multilingual voices, the narration preset picked from the tone of the message, and a spectrum inside the button while the voice plays. Ships a configuration card on the plugin's own page in the Plugins tab (presets, user presets, live sliders, pronunciation dictionary, code-stripping switch) projected from the plugin row's own schemastery Config.",
   "author": "ZEROTOOL",
   "license": "MIT",
-  "homepage": "https://github.com/ZEROTOOL/dsh-voice-v#readme",
+  "homepage": "https://github.com/zerotoo1/dsh-anima-vi#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ZEROTOOL/dsh-voice-v.git"
+    "url": "git+https://github.com/zerotoo1/dsh-anima-vi.git"
   },
   "bugs": {
-    "url": "https://github.com/ZEROTOOL/dsh-voice-v/issues"
+    "url": "https://github.com/zerotoo1/dsh-anima-vi/issues"
   },
   "type": "module",
   "main": "./lib/index.js",

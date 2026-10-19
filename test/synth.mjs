@@ -21,8 +21,9 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { PassThrough, Writable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -385,6 +386,383 @@ await test('a different pitch changes the cache slot', async () => {
   assert.notEqual(base.key, changed.key);
 });
 
+console.log('\nedge-tts stays the default');
+
+/**
+ * A fake `edge-tts` process that records the argv it was given and writes the
+ * media file the service asked for. It is how the local path is proved to be
+ * unchanged without spawning anything.
+ * @param _bin - Executable path, ignored.
+ * @param argv - The argv the service built.
+ * @returns An EventEmitter shaped like a ChildProcess.
+ */
+function argvRecordingEdgeTts(_bin, argv) {
+  const child = new EventEmitter();
+  child.kill = () => {};
+  argvRecordingEdgeTts.calls.push(argv);
+  const media = argv[argv.indexOf('--write-media') + 1];
+  setImmediate(() => {
+    try {
+      writeFileSync(media, Buffer.from('ID3local'.padEnd(1200, '.')));
+      child.emit('close', 0);
+    } catch (error) {
+      child.emit('error', error);
+    }
+  });
+  return child;
+}
+argvRecordingEdgeTts.calls = [];
+
+await test('without a custom endpoint the local CLI is spawned with the very same argv', async () => {
+  argvRecordingEdgeTts.calls.length = 0;
+  const local = createSynthService({
+    binPath: 'edge-tts',
+    cacheDir,
+    voice: DEFAULT_VOICE,
+    rate: '+6%',
+    pitch: '+12Hz',
+    timeoutMs: 10000,
+    spawnImpl: argvRecordingEdgeTts,
+  });
+  await local.ensure('Аргументы остаются прежними.');
+  assert.equal(argvRecordingEdgeTts.calls.length, 1, 'the local CLI must still be spawned');
+  const argv = argvRecordingEdgeTts.calls[0];
+  assert.deepEqual(argv.slice(0, 8), [
+    '--voice',
+    DEFAULT_VOICE,
+    '--rate',
+    '+6%',
+    '--pitch',
+    '+12Hz',
+    '--volume',
+    '+0%',
+  ]);
+  assert.equal(argv[8], '--no-progress');
+  assert.equal(argv[9], '--write-media');
+  assert.equal(argv[11], '--file');
+});
+
+await test('a provider of custom without a base URL and a model still uses the local CLI', async () => {
+  argvRecordingEdgeTts.calls.length = 0;
+  const halfConfigured = createSynthService({
+    binPath: 'edge-tts',
+    cacheDir,
+    timeoutMs: 10000,
+    spawnImpl: argvRecordingEdgeTts,
+    voiceOptions: () => ({
+      voice: DEFAULT_VOICE,
+      rate: '+6%',
+      pitch: '+12Hz',
+      volume: '+0%',
+      ttsProvider: 'custom',
+      customBaseUrl: 'https://api.openai.com/v1',
+      customApiKey: 'sk-test-secret',
+      customModel: '',
+    }),
+  });
+  await halfConfigured.ensure('Недоопределённый провайдер.');
+  assert.equal(argvRecordingEdgeTts.calls.length, 1, 'an incomplete endpoint falls back to edge-tts');
+});
+
+console.log('\ncustom TTS endpoint (OpenAI-compatible, fake fetch)');
+
+const CUSTOM_API_KEY = 'sk-test-secret-42';
+const customCacheDir = await mkdtemp(join(tmpdir(), 'dsh-voice-v-custom-'));
+
+/**
+ * A fake `fetch` for the custom endpoint: it records every request and
+ * answers with what the handler returns.
+ * @param handler - `(url, init, callNumber) => response`.
+ * @returns The fake fetch, with a `calls` array on it.
+ */
+function recordingFetch(handler) {
+  const calls = [];
+  const impl = async (url, init) => {
+    calls.push({
+      url,
+      method: init?.method,
+      headers: init?.headers ?? {},
+      body: init?.body === undefined ? null : JSON.parse(init.body),
+    });
+    return handler(url, init, calls.length);
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+/**
+ * A successful answer carrying the given bytes.
+ * @param bytes - The audio bytes the endpoint "returned".
+ * @returns A Response-like object.
+ */
+function audioAnswer(bytes) {
+  return {
+    ok: true,
+    status: 200,
+    async arrayBuffer() {
+      return new Uint8Array(bytes).buffer;
+    },
+  };
+}
+
+/**
+ * A synthesis service on the custom endpoint.
+ * @param options - `fetchImpl`, and the provider fields to report.
+ * @returns The service.
+ */
+function customSynth(options = {}) {
+  return createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl: options.fetchImpl,
+    voiceOptions: () => ({
+      voice: 'alloy',
+      rate: '+6%',
+      pitch: '+12Hz',
+      volume: '+0%',
+      ttsProvider: 'custom',
+      customBaseUrl: 'https://api.openai.com/v1',
+      customApiKey: CUSTOM_API_KEY,
+      customModel: 'tts-1',
+      ...(options.provider ?? {}),
+    }),
+  });
+}
+
+await test('the custom endpoint is asked the OpenAI way, and its bytes are cached', async () => {
+  const audio = Buffer.from('ID3custom-endpoint-audio'.padEnd(2048, '.'));
+  const fetchImpl = recordingFetch(async () => audioAnswer(audio));
+  const service = customSynth({ fetchImpl });
+
+  const result = await service.ensure('Проверка кастомного эндпоинта.');
+  assert.equal(fetchImpl.calls.length, 1, 'the endpoint must be asked exactly once');
+
+  const call = fetchImpl.calls[0];
+  assert.equal(call.url, 'https://api.openai.com/v1/audio/speech');
+  assert.equal(call.method, 'POST');
+  assert.equal(call.headers['Content-Type'], 'application/json');
+  assert.equal(call.headers.Authorization, `Bearer ${CUSTOM_API_KEY}`);
+  assert.deepEqual(call.body, {
+    model: 'tts-1',
+    input: 'Проверка кастомного эндпоинта.',
+    voice: 'alloy',
+    response_format: 'mp3',
+    speed: 1.06,
+  });
+
+  // The bytes landed in the plugin's own MP3 cache.
+  assert.equal(result.cached, false);
+  assert.ok(existsSync(result.file), `missing cache file ${result.file}`);
+  assert.deepEqual(await readFile(result.file), audio);
+
+  // And the second call is served from the cache: no second request.
+  const again = await service.ensure('Проверка кастомного эндпоинта.');
+  assert.equal(again.cached, true);
+  assert.equal(fetchImpl.calls.length, 1, 'a cache hit must not ask the endpoint again');
+});
+
+await test('no configured tempo means no speed parameter', async () => {
+  const fetchImpl = recordingFetch(async () => audioAnswer(Buffer.from('ID3no-speed'.padEnd(1024, '.'))));
+  const service = customSynth({ fetchImpl, provider: { rate: '' } });
+  await service.ensure('Без темпа.');
+  assert.equal(fetchImpl.calls.length, 1);
+  assert.equal('speed' in fetchImpl.calls[0].body, false, 'an unset tempo sends no speed');
+  assert.deepEqual(fetchImpl.calls[0].body, {
+    model: 'tts-1',
+    input: 'Без темпа.',
+    voice: 'alloy',
+    response_format: 'mp3',
+  });
+});
+
+await test('a base URL that already names the endpoint is not doubled', async () => {
+  const fetchImpl = recordingFetch(async () => audioAnswer(Buffer.from('ID3full-url'.padEnd(1024, '.'))));
+  const service = customSynth({
+    fetchImpl,
+    provider: { customBaseUrl: 'https://api.openai.com/v1/audio/speech' },
+  });
+  await service.ensure('Полный URL эндпоинта.');
+  assert.equal(fetchImpl.calls[0].url, 'https://api.openai.com/v1/audio/speech');
+});
+
+await test('a trailing slash in the base URL does not double the separator', async () => {
+  const fetchImpl = recordingFetch(async () => audioAnswer(Buffer.from('ID3slash'.padEnd(1024, '.'))));
+  const service = customSynth({
+    fetchImpl,
+    provider: { customBaseUrl: 'https://api.siliconflow.cn/v1/' },
+  });
+  await service.ensure('Base URL со слешем.');
+  assert.equal(fetchImpl.calls[0].url, 'https://api.siliconflow.cn/v1/audio/speech');
+});
+
+await test('the two providers never share a cache slot', async () => {
+  const text = 'Один и тот же текст у двух провайдеров.';
+  const edgeKey = cacheKeyFor({ text, voice: 'alloy', rate: '+6%', pitch: '+12Hz', volume: '+0%' });
+  const customKey = cacheKeyFor({
+    text,
+    voice: 'alloy',
+    rate: '+6%',
+    pitch: '+12Hz',
+    volume: '+0%',
+    ttsProvider: 'custom',
+    customModel: 'tts-1',
+    customBaseUrl: 'https://api.openai.com/v1',
+  });
+  assert.notEqual(edgeKey, customKey, 'the provider must be part of the cache key');
+
+  // The key itself is never part of it.
+  const otherKey = cacheKeyFor({
+    text,
+    voice: 'alloy',
+    rate: '+6%',
+    pitch: '+12Hz',
+    volume: '+0%',
+    ttsProvider: 'custom',
+    customModel: 'tts-1',
+    customBaseUrl: 'https://api.openai.com/v1',
+    customApiKey: 'sk-a-completely-different-key',
+  });
+  assert.equal(customKey, otherKey, 'the API key must not reach the cache key');
+
+  // The file the local CLI produced is not served for a custom request, and
+  // the other way round.
+  const local = createSynthService({
+    binPath: 'edge-tts',
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    spawnImpl: argvRecordingEdgeTts,
+    voiceOptions: () => ({
+      voice: 'alloy',
+      rate: '+6%',
+      pitch: '+12Hz',
+      volume: '+0%',
+      ttsProvider: 'edge',
+    }),
+  });
+  const localResult = await local.ensure(text);
+  assert.equal(localResult.cached, false);
+
+  const fetchImpl = recordingFetch(async () => audioAnswer(Buffer.from('ID3other-provider'.padEnd(1024, '.'))));
+  const service = customSynth({ fetchImpl });
+  const customResult = await service.ensure(text);
+  assert.equal(customResult.cached, false, 'a custom request must not be served the edge-tts file');
+  assert.equal(fetchImpl.calls.length, 1, 'the custom request must reach the endpoint');
+  assert.notEqual(localResult.key, customResult.key);
+});
+
+await test('a failing endpoint names the status and the provider’s own error text', async () => {
+  const fetchImpl = recordingFetch(async () => ({
+    ok: false,
+    status: 401,
+    async text() {
+      return JSON.stringify({ error: { message: 'Incorrect API key provided' } });
+    },
+  }));
+  const service = customSynth({ fetchImpl });
+  await assert.rejects(
+    () => service.ensure('Ошибка авторизации.'),
+    (error) => {
+      assert.match(String(error?.message ?? error), /401/);
+      assert.match(String(error?.message ?? error), /Incorrect API key provided/);
+      assert.equal(String(error?.message ?? error).includes(CUSTOM_API_KEY), false, 'the key must not leak');
+      return true;
+    },
+  );
+});
+
+await test('a network failure is reported the same way, and never with the key', async () => {
+  const fetchImpl = recordingFetch(async () => {
+    throw new Error(`connect ECONNREFUSED with ${CUSTOM_API_KEY}`);
+  });
+  const service = customSynth({ fetchImpl });
+  await assert.rejects(
+    () => service.ensure('Сеть недоступна.'),
+    (error) => {
+      const message = String(error?.message ?? error);
+      assert.match(message, /custom TTS endpoint request failed/);
+      assert.equal(message.includes(CUSTOM_API_KEY), false, 'the key must not leak into an error');
+      assert.match(message, /\*\*\*/, 'the key is redacted, not dropped silently');
+      return true;
+    },
+  );
+});
+
+await test('a provider that echoes the key back does not get it into the message', async () => {
+  const fetchImpl = recordingFetch(async () => ({
+    ok: false,
+    status: 500,
+    async text() {
+      return `internal error: token ${CUSTOM_API_KEY} rejected`;
+    },
+  }));
+  const service = customSynth({ fetchImpl });
+  await assert.rejects(
+    () => service.ensure('Провайдер повторил ключ.'),
+    (error) => {
+      const message = String(error?.message ?? error);
+      assert.match(message, /500/);
+      assert.equal(message.includes(CUSTOM_API_KEY), false, 'the key must not leak into an error');
+      return true;
+    },
+  );
+});
+
+await test('a hanging endpoint is stopped by the plugin’s own timeout', async () => {
+  const fetchImpl = recordingFetch(
+    async (_url, init) =>
+      new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal !== undefined && typeof signal.addEventListener === 'function') {
+          signal.addEventListener('abort', () => {
+            const error = new Error('the request was aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        }
+      }),
+  );
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 60,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'alloy',
+      rate: '+6%',
+      pitch: '+12Hz',
+      volume: '+0%',
+      ttsProvider: 'custom',
+      customBaseUrl: 'https://api.openai.com/v1',
+      customApiKey: CUSTOM_API_KEY,
+      customModel: 'tts-1',
+    }),
+  });
+  await assert.rejects(
+    () => service.ensure('Эндпоинт не отвечает.'),
+    (error) => {
+      const message = String(error?.message ?? error);
+      assert.match(message, /timed out after 60 ms/);
+      assert.equal(message.includes(CUSTOM_API_KEY), false, 'the key must not leak into an error');
+      return true;
+    },
+  );
+});
+
+await test('the local path is untouched by a failing endpoint', async () => {
+  argvRecordingEdgeTts.calls.length = 0;
+  const local = createSynthService({
+    binPath: 'edge-tts',
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    spawnImpl: argvRecordingEdgeTts,
+  });
+  const result = await local.ensure('Локальный путь после сбоя.');
+  assert.equal(result.cached, false);
+  assert.equal(argvRecordingEdgeTts.calls.length, 1, 'the local CLI still works');
+  assert.ok(existsSync(result.file));
+});
+
 console.log('\nroute handler (mock req/res, no port bound)');
 
 const settings = resolveVoiceConfig({ cacheDir });
@@ -630,6 +1008,7 @@ if (realSessionFile !== undefined && realSessionFile !== '' && existsSync(realSe
 
 // ---------------------------------------------------------------------------
 await rm(cacheDir, { recursive: true, force: true }).catch(() => {});
+await rm(customCacheDir, { recursive: true, force: true }).catch(() => {});
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

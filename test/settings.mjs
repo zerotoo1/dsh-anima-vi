@@ -20,6 +20,7 @@ import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
@@ -38,10 +39,12 @@ import {
   SETTINGS_FIELDS,
   SETTINGS_NAMESPACE,
   SPECTRUM_VARIANTS,
+  TTS_PROVIDERS,
   buildSettingsSchema,
   clampToRange,
   describePresets,
   describeVoices,
+  normalizeTtsProvider,
   parsePitchHz,
   parseRatePct,
   pickSettingsBase,
@@ -603,6 +606,10 @@ await test('the user section may only shadow the fields the namespace owns', () 
     'dictionary',
     'userPresets',
     'spectrum',
+    'ttsProvider',
+    'customBaseUrl',
+    'customApiKey',
+    'customModel',
   ]);
 });
 
@@ -657,9 +664,11 @@ await test('the settings schema declares exactly the namespace fields', async ()
  * A stand-in for the schemastery namespace: it records what the schema asks
  * for, so the shape of a field can be checked in a deployment where no
  * volatile-capable schemastery resolves at all.
+ * @param options - `withoutConst` drops `z.const`, so the field that uses it
+ *   has to fall back to a plain string.
  * @returns The fake namespace.
  */
-function fakeSchemaFactory() {
+function fakeSchemaFactory(options = {}) {
   const make = (type, extra) => {
     const schema = { type, meta: {}, ...extra };
     schema.default = (value) => {
@@ -680,16 +689,19 @@ function fakeSchemaFactory() {
     };
     return schema;
   };
-  return {
+  const factory = {
     string: () => make('string'),
     number: () => make('number'),
     boolean: () => make('boolean'),
     any: () => make('any'),
-    const: (value) => make('const', { value }),
     union: (list) => make('union', { list }),
     dict: (inner) => make('dict', { inner }),
     object: (dict) => make('object', { dict }),
   };
+  // `z.const` is what the provider field's allow-list is built from. A copy
+  // without it must not break the namespace.
+  if (options.withoutConst !== true) factory.const = (value) => make('const', { value });
+  return factory;
 }
 
 await test('the settings schema declares a volatile user-preset pool', () => {
@@ -727,6 +739,176 @@ await test('the settings schema accepts a user preset and the live reader sees i
   assert.equal(live().userPresets['user-moy'].label, 'Мой');
   assert.equal(live().presets['user-moy'].rate, '+5%');
   assert.equal(live().presets['user-moy'].pitch, '+2Hz');
+});
+
+console.log('\ncustom TTS endpoint (the settings surface)');
+
+await test('the schema declares the custom endpoint as four volatile fields', () => {
+  const schema = buildSettingsSchema(fakeSchemaFactory());
+
+  const provider = schema.dict.ttsProvider;
+  assert.ok(provider !== undefined, 'the provider must be declared');
+  // `volatileForm` keeps only the volatile children: a plain field would drop
+  // the whole entry from the form, and the card would never mount.
+  assert.equal(provider.meta.volatile, true, 'the provider must be volatile so the Host accepts a write');
+  assert.equal(provider.meta.default, 'edge', 'edge-tts is the default provider');
+  assert.equal(provider.meta.loose, true, 'an unknown provider must fall back, not fail the whole entry');
+  assert.equal(provider.type, 'union');
+  assert.deepEqual(
+    provider.list.map((entry) => entry.value),
+    ['edge', 'custom'],
+  );
+
+  for (const field of ['customBaseUrl', 'customApiKey', 'customModel']) {
+    const declared = schema.dict[field];
+    assert.ok(declared !== undefined, `${field} must be declared`);
+    assert.equal(declared.meta.volatile, true, `${field} must be volatile`);
+    assert.equal(declared.type, 'string');
+  }
+
+  // The real schemastery, when this deployment can resolve one.
+  const loaded = loadSchemaFactory();
+  if (typeof loaded.z?.object === 'function') {
+    const real = buildSettingsSchema(loaded.z);
+    assert.equal(real.dict.ttsProvider.meta.volatile, true);
+    assert.equal(real.dict.ttsProvider.meta.default, 'edge');
+    for (const field of ['customBaseUrl', 'customApiKey', 'customModel']) {
+      assert.equal(real.dict[field].meta.volatile, true, `${field} must be volatile`);
+    }
+  }
+});
+
+await test('a schemastery copy without z.const degrades the provider field to a plain string', () => {
+  // The runtime's schemastery is 3.18.x: it has `z.const` and `z.union`, and
+  // no `z.literal`. A copy without them must not break the namespace — the
+  // field falls back to a plain string, and the allow-list stays in
+  // `normalizeTtsProvider`.
+  const schema = buildSettingsSchema(fakeSchemaFactory({ withoutConst: true }));
+  const provider = schema.dict.ttsProvider;
+  assert.ok(provider !== undefined, 'the provider must still be declared');
+  assert.equal(provider.type, 'string', 'without z.const the field is a plain string');
+  assert.equal(provider.meta.volatile, true, 'and it is still volatile');
+  assert.equal(provider.meta.default, 'edge', 'and it still defaults to edge-tts');
+  assert.equal(normalizeTtsProvider('nope'), 'edge', 'the allow-list lives in the resolver');
+});
+
+await test('the schemastery the runtime resolves has the constructs the provider field uses', () => {
+  const path = resolvePeerPackage('@deepseek-ai/schemastery', candidateAnchors());
+  if (path === null) {
+    // No peer package in this deployment: the graceful path is the only one
+    // available, and the shape itself is checked above.
+    assert.ok(true);
+    return;
+  }
+  const z = createRequire(import.meta.url)(path);
+  assert.equal(typeof z.const, 'function', 'z.const must exist: the allow-list is built from it');
+  assert.equal(typeof z.union, 'function', 'z.union must exist: the allow-list is a union');
+});
+
+await test('an unknown provider falls back to edge-tts', () => {
+  assert.equal(normalizeTtsProvider(undefined), 'edge');
+  assert.equal(normalizeTtsProvider(''), 'edge');
+  assert.equal(normalizeTtsProvider('нope'), 'edge');
+  assert.equal(normalizeTtsProvider('CUSTOM-SOMETHING'), 'edge');
+  assert.equal(normalizeTtsProvider('custom'), 'custom');
+  assert.equal(normalizeTtsProvider(' edge '), 'edge');
+
+  assert.equal(resolveVoiceConfig({}).ttsProvider, 'edge');
+  assert.equal(resolveVoiceConfig({ ttsProvider: 'нет-такого' }).ttsProvider, 'edge');
+  assert.equal(resolveVoiceConfig({ ttsProvider: 'custom' }).ttsProvider, 'custom');
+
+  // The composition layer carries the field, and the user layer may shadow it.
+  const base = pickSettingsBase({
+    ttsProvider: 'custom',
+    customBaseUrl: 'https://api.openai.com/v1',
+    customApiKey: 'sk-secret',
+    customModel: 'tts-1',
+    binPath: '/nowhere',
+  });
+  assert.equal(base.ttsProvider, 'custom');
+  assert.equal(base.customBaseUrl, 'https://api.openai.com/v1');
+  assert.equal(base.customModel, 'tts-1');
+  assert.equal('binPath' in base, false);
+  assert.equal(pickSettingsSection({ ttsProvider: 'edge' }).ttsProvider, 'edge');
+});
+
+await test('the key never leaves the host: the config payload reports only whether one is set', async () => {
+  const settings = resolveVoiceConfig({
+    ttsProvider: 'custom',
+    customBaseUrl: 'https://api.openai.com/v1',
+    customApiKey: 'sk-super-secret-value',
+    customModel: 'tts-1',
+  });
+  const routes = createVoiceHandler({
+    ctx: { get: () => undefined, logger: { warn: () => {} } },
+    settings,
+    synth: makeSynth(() => ({ voice: 'alloy', rate: '+6%', pitch: '+12Hz', volume: '+0%' })),
+  });
+
+  const res = await callRoute(routes, { method: 'GET', url: '/dsh-voice-v/config' });
+  assert.equal(res.status, 200);
+  const payload = res.json();
+  assert.equal(payload.ttsProvider, 'custom');
+  assert.equal(payload.customBaseUrl, 'https://api.openai.com/v1');
+  assert.equal(payload.customModel, 'tts-1');
+  assert.equal(payload.customApiKeySet, true, 'the payload says that a key is set');
+  assert.equal('customApiKey' in payload, false, 'the key itself is not in the payload');
+  const raw = res.collected().toString('utf8');
+  assert.equal(raw.includes('sk-super-secret-value'), false, 'the key must not appear in the payload at all');
+
+  // And the same for the health route.
+  const health = await callRoute(routes, { method: 'GET', url: '/dsh-voice-v/health' });
+  assert.equal(health.collected().toString('utf8').includes('sk-super-secret-value'), false);
+
+  // A namespace without a key says so.
+  const plain = createVoiceHandler({
+    ctx: { get: () => undefined, logger: { warn: () => {} } },
+    settings: resolveVoiceConfig({}),
+    synth: makeSynth(() => ({ voice: DEFAULT_VOICE, rate: '+6%', pitch: '+12Hz', volume: '+0%' })),
+  });
+  const plainRes = await callRoute(plain, { method: 'GET', url: '/dsh-voice-v/config' });
+  assert.equal(plainRes.json().customApiKeySet, false);
+});
+
+await test('the custom provider travels with the per-request override', async () => {
+  const synth = toneRecordingSynth();
+  const routes = createVoiceHandler({
+    ctx: { get: () => undefined, logger: { warn: () => {} } },
+    liveSettings: () =>
+      resolveVoiceConfig({
+        ttsProvider: 'custom',
+        customBaseUrl: 'https://api.openai.com/v1',
+        customApiKey: 'sk-super-secret-value',
+        customModel: 'tts-1',
+      }),
+    synth,
+  });
+
+  const res = await callRoute(routes, {
+    method: 'GET',
+    url: `/dsh-voice-v/speak?text=${encodeURIComponent('Блин, я совсем устала.')}`,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.json().ttsProvider, 'custom');
+  assert.equal(synth.calls[0].override.ttsProvider, 'custom');
+  assert.equal(synth.calls[0].override.customBaseUrl, 'https://api.openai.com/v1');
+  assert.equal(synth.calls[0].override.customModel, 'tts-1');
+  assert.equal(synth.calls[0].override.customApiKey, 'sk-super-secret-value');
+});
+
+await test('the edge-tts override is left exactly as it was', async () => {
+  const synth = toneRecordingSynth();
+  const routes = createVoiceHandler({
+    ctx: { get: () => undefined, logger: { warn: () => {} } },
+    liveSettings: () => resolveVoiceConfig({ preset: 'ustaly' }),
+    synth,
+  });
+
+  await callRoute(routes, {
+    method: 'GET',
+    url: `/dsh-voice-v/speak?text=${encodeURIComponent('Блин, я совсем устала.')}`,
+  });
+  assert.deepEqual(Object.keys(synth.calls[0].override).sort(), ['pitch', 'rate', 'voice', 'volume']);
 });
 
 console.log('\nlive settings');
@@ -2664,6 +2846,7 @@ function configPayload(settings, extra = {}) {
     pitchRange: PITCH_RANGE,
     dictionaryDefaults: DEFAULT_PRONUNCIATION,
     defaultPreviewText: DEFAULT_PREVIEW_TEXT,
+    ttsProviders: TTS_PROVIDERS,
     settingsRegistered: true,
     ...extra,
   };
@@ -2969,6 +3152,10 @@ await test('the card still exposes every setting it owned before', async () => {
     'dictionary',
     'userPresets',
     'spectrum',
+    'ttsProvider',
+    'customBaseUrl',
+    'customApiKey',
+    'customModel',
   ]);
 
   const mini = createMiniReact();
@@ -3086,6 +3273,219 @@ await test('the card offers the variants the host reported and stages one write 
   await mounted.rerender();
 
   assert.deepEqual(writes, [['set', 'spectrum', 'wave']], 'one write, carrying the chosen variant');
+});
+
+await test('the card offers the synthesis provider and hides the endpoint fields by default', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({
+    ok: true,
+    json: async () => configPayload(settings, { ttsProvider: 'edge', customApiKeySet: false }),
+  });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings },
+      base: {},
+      user: {},
+      revision: 20,
+      writable: true,
+      mode: 'host',
+    },
+    [],
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+  const text = textOf(mounted.tree);
+  assert.ok(text.includes('Синтез речи'), 'the card must have a group of its own for the provider');
+  assert.ok(text.includes('edge-tts остаётся дефолтом'), 'the card explains that edge-tts is the default');
+
+  // The provider is a dropdown of the two providers.
+  const select = elementsOf(mounted.tree).find(
+    (node) => node.type === 'select' && node.props['aria-label'] === 'Провайдер синтеза',
+  );
+  assert.ok(select !== undefined, 'the card must offer the provider as a dropdown');
+  const options = elementsOf(select).filter((node) => node.type === 'option');
+  assert.deepEqual(
+    options.map((option) => option.props.value),
+    ['edge', 'custom'],
+  );
+  assert.ok(textOf(options[0]).includes('edge-tts'));
+  assert.ok(textOf(options[1]).includes('OpenAI'));
+  assert.equal(select.props.value, 'edge', 'the dropdown shows the provider in use');
+
+  // The endpoint's own fields belong to the endpoint only.
+  for (const label of ['Base URL эндпоинта', 'Model ID эндпоинта', 'API Key эндпоинта']) {
+    assert.equal(
+      elementsOf(mounted.tree).some((node) => node.type === 'input' && node.props['aria-label'] === label),
+      false,
+      `${label} must stay hidden while edge-tts is in use`,
+    );
+  }
+});
+
+await test('choosing the custom provider shows the endpoint and stages one write per field', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({
+    ok: true,
+    json: async () => configPayload(settings, { ttsProvider: 'edge', customApiKeySet: true }),
+  });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+
+  const writes = [];
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings },
+      base: {},
+      user: {},
+      revision: 21,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+
+  const provider = elementsOf(mounted.tree).find(
+    (node) => node.type === 'select' && node.props['aria-label'] === 'Провайдер синтеза',
+  );
+  provider.props.onChange({ target: { value: 'custom' } });
+  await mounted.rerender();
+
+  // The endpoint's fields are on screen now.
+  const base = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'Base URL эндпоинта',
+  );
+  const model = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'Model ID эндпоинта',
+  );
+  const key = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'API Key эндпоинта',
+  );
+  assert.ok(base !== undefined && model !== undefined && key !== undefined);
+  assert.equal(key.props.type, 'password', 'the key field must be a password field');
+  assert.equal(key.props.value, '', 'the key field starts empty: the key is never sent to the browser');
+  assert.match(key.props.placeholder, /ключ сохранён/, 'the field says that a key is already stored');
+
+  // The voice hint follows the provider.
+  assert.ok(
+    textOf(mounted.tree).includes('id голоса провайдера'),
+    'the voice control explains that the id belongs to the provider',
+  );
+
+  base.props.onChange({ target: { value: 'https://api.openai.com/v1' } });
+  model.props.onChange({ target: { value: 'tts-1' } });
+  key.props.onChange({ target: { value: 'sk-typed-by-the-user' } });
+  await mounted.rerender();
+
+  const save = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить' && node.props.disabled === false,
+  );
+  assert.ok(save !== undefined, 'Save must become available once something is staged');
+  await save.props.onClick();
+  await mounted.rerender();
+
+  assert.deepEqual(
+    writes,
+    [
+      ['set', 'ttsProvider', 'custom'],
+      ['set', 'customBaseUrl', 'https://api.openai.com/v1'],
+      ['set', 'customModel', 'tts-1'],
+      ['set', 'customApiKey', 'sk-typed-by-the-user'],
+    ],
+    'one write per field, and the key is written because something was typed',
+  );
+});
+
+await test('the key is written only when something was typed, and the reset stages an unset', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({
+    ok: true,
+    json: async () => configPayload(settings, { ttsProvider: 'custom', customApiKeySet: true }),
+  });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+
+  const writes = [];
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings, ttsProvider: 'custom' },
+      base: {},
+      user: {},
+      revision: 22,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+  const key = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'API Key эндпоинта',
+  );
+  assert.ok(key !== undefined, 'the key field must be on screen for the custom provider');
+  assert.equal(key.props.value, '', 'the field starts empty even when a key is stored');
+
+  // The reset control stages the unset, and nothing else.
+  const reset = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сбросить ключ',
+  );
+  assert.ok(reset !== undefined, 'the card must offer a way to drop the stored key');
+  reset.props.onClick();
+  await mounted.rerender();
+
+  const save = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить' && node.props.disabled === false,
+  );
+  assert.ok(save !== undefined);
+  await save.props.onClick();
+  await mounted.rerender();
+
+  assert.deepEqual(writes, [['unset', 'customApiKey']], 'the key is unset, never written empty');
+});
+
+await test('a card that never typed a key writes no key at all', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({
+    ok: true,
+    json: async () => configPayload(settings, { ttsProvider: 'custom', customApiKeySet: false }),
+  });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+
+  const writes = [];
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings, ttsProvider: 'custom' },
+      base: {},
+      user: {},
+      revision: 23,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+  const key = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'API Key эндпоинта',
+  );
+  assert.ok(key !== undefined);
+  assert.match(key.props.placeholder, /не задан/, 'the field says that no key is stored');
+
+  // Nothing was touched, so nothing is written.
+  const save = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить',
+  );
+  assert.equal(save.props.disabled, true, 'Save stays disabled while nothing is staged');
+  assert.deepEqual(writes, []);
 });
 
 // ---------------------------------------------------------------------------
