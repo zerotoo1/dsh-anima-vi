@@ -16,9 +16,10 @@ whether code is read aloud — all without touching `package.json` or
 - **The preset follows the tone of the message** — «блин, устала» is read as
   *Усталый*, «люблю, скучаю» as *Живой*, a technical answer as *Спокойный*,
   flirt as *Дерзкий* (`lib/tone.js`, plain rules, no model, no extra context).
-- **A spectrum inside the button** while the voice plays — four variants, from a
-  real frequency analyser to a CSS-only pulse, switchable and switchable off in
-  the card.
+- **A live visualization while the voice plays** — five variants, from a real
+  frequency analyser and an oscilloscope inside the button to a wide waveform
+  drawn above the composer, plus two CSS-only ones; switchable, and switchable
+  off, in the card.
 - **Your own presets** — save the sliders as a preset, keep it next to the
   shipped ones, delete it when it is not needed.
 
@@ -34,6 +35,10 @@ Repository: <https://github.com/zerotoo1/dsh-anima-vi>
   in) and the settings card in `plugins.bundle.config`, keyed on the bundle's
   package name. The card reads and writes the `dsh-voice-v` namespace through
   the `configForms` service, and only while the Host serves that namespace.
+  The form service is waited for in a fiber of its own, and the card is mounted
+  through `configForms.whileServed` — so the card appears whenever the Host
+  starts serving the namespace, and not only when the plugin happened to mount
+  before the Host's settings document arrived.
 
 ## Requirements
 
@@ -44,8 +49,11 @@ Repository: <https://github.com/zerotoo1/dsh-anima-vi>
 | Network | `edge-tts` talks to the Microsoft speech service; the MP3 cache in `~/.dsh/cache/dsh-voice-v` spares the repeats |
 | npm packages | **none** — the plugin declares no `dependencies`; the browser half needs only `react`, which the harness shell provides |
 
-The `edge-tts` path is a deployment key: `binPath` in `cordis.patch.yml`
-(default: the `edge-tts.exe` of the local Python runtime).
+The `edge-tts` path is a deployment key: `binPath` in `cordis.patch.yml`. The
+default is the bare name `edge-tts`, resolved through `PATH` — which is where a
+plain `pip install edge-tts` puts it — so the repository carries no
+machine-specific path. `DSH_VOICE_V_EDGE_TTS` overrides the default for a
+one-off run, and a deployment that keeps the CLI somewhere else sets `binPath`.
 
 
 ## Where the settings live
@@ -118,12 +126,15 @@ Settings → Plugins → **Plugin configuration** → *Озвучка ответ
 * **Прослушать** — synthesizes with exactly what the sliders show, saved or not,
   through `POST /dsh-voice-v/preview`, and plays the MP3 immediately. The
   preview never reads and never writes the settings document.
-* **Словарь произношения** — a collapsed block at the bottom of the card: the
-  summary line reports how many terms the dictionary holds (`150 терминов`) and
-  how many of them the user owns (`· 3 изменено`). Open it to edit the
-  transcription of a term, reset a built-in row back to its default, delete an
-  added row, or add a new pair. Each row has its own ▶ button that auditions
-  that transcription.
+* **Словарь произношения** — a collapsed block at the bottom of the card. It
+  lists **only the terms the user owns**: the shipped table stays in the host
+  (`dictionaryDefaults`) and is never rendered, so the block is a short list
+  instead of a hundred and fifty rows. Two fields and a button: a pair is
+  written to the settings the moment it is added — no trip back to the card's
+  own Save, which stays unarmed. Editing a row's reading writes on blur, and
+  **Удалить** drops the term from the user layer, so a built-in term falls back
+  to its shipped reading. Each row has its own ▶ button that auditions that
+  transcription.
 * **Вырезать код из озвучки** — see below.
 * **Пресет по тону сообщения** — see "The preset by the tone of the message"
   below. On by default.
@@ -135,9 +146,11 @@ Settings → Plugins → **Plugin configuration** → *Озвучка ответ
   never hides the voice in use.
 * **Визуализация** — see "The visualization inside the message button" below.
   On by default.
-* **Синтез речи** — the provider dropdown (`edge-tts` by default, or an
-  OpenAI-compatible endpoint) and, while the endpoint is chosen, its base URL,
-  its model id and its key. See "Custom TTS Providers" below.
+* **Синтез речи** — the provider dropdown (`edge-tts` by default, an
+  OpenAI-compatible endpoint, Yandex SpeechKit or Google Cloud TTS) and, while
+  one of them is chosen, its own fields: the base URL, the model and the key
+  for the endpoint, the voice and the key for Yandex and for Google. See
+  "Custom TTS Providers" below.
 * **Сохранить / Отменить правки** — nothing is written until Save: the card
   stages the fields the user touched and sends one `scope.set` (or
   `scope.unset`) per field. A header note marks unsaved edits, and a namespace
@@ -194,16 +207,125 @@ A deployment that has keys of its own can point the plugin at an
 
 | field | meaning |
 |---|---|
-| `ttsProvider` | `edge` (default) or `custom` |
+| `ttsProvider` | `edge` (default), `custom`, `yandex`, `google` or `google-free` |
 | `customBaseUrl` | the base URL, e.g. `https://api.openai.com/v1` |
 | `customApiKey` | the provider's key — a secret |
 | `customModel` | the model id, e.g. `tts-1` |
+| `yandexApiKey` | the Yandex SpeechKit key — a secret |
+| `yandexVoice` | the Yandex voice: `marina`, `ermil`, `pavel`, `male`, `jane` |
+| `googleApiKey` | the Google Cloud API key — a secret |
+| `googleVoice` | the Google voice: `ru-RU-Wavenet-A` … `ru-RU-Standard-B` |
 
-The endpoint's own fields appear only while `custom` is selected. All four are
+The endpoint's own fields appear only while `custom` is selected, and the
+Yandex ones only while `yandex` is selected, and the Google ones only while
+`google` is selected. All of them are
 ordinary settings: the **user layer owns them** and overrides the deployment
 layer, exactly like every other setting. The deployment layer may prefill
 them in the plugin row's `config` (`cordis.patch.yml`) — the key belongs in the
 profile's user layer and **never in the repository**.
+
+### The Yandex provider
+
+Yandex SpeechKit is spoken of separately because it is not an
+OpenAI-compatible endpoint: it has its own REST shape.
+
+```
+POST https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis?voice=<id>&format=mp3&sampleRate=48000&speed=<x>
+Authorization: Api-Key <yandexApiKey>
+X-DataLoggin-Enabled: false
+{"text": "...", "hints": [{"voice": "<id>", "speed": 1.06, "pitchShift": 12, "volume": 1.1}], "outputAudioSpec": {"containerAudio": {"containerAudioType": "MP3"}}}
+```
+
+The route is the one the service's own descriptor names: the gRPC reflection of
+the same host describes the service `speechkit.tts.v3.Synthesizer` and its rpc
+`UtteranceSynthesis`, whose http rule is `POST /tts/v3/utteranceSynthesis` with
+the body `*`. The older `/tts/v3/voiceSynthesis` route is not in that
+descriptor and answers 404 with a plain-text "Not Found" — it was the v2 shape,
+guessed.
+
+* `hints` is an **array** — the service reads the body with Go's JSON decoder
+  and rejects an object there ("cannot unmarshal object into Go value of type
+  `[]json.RawMessage`");
+* the tempo travels as a plain multiplier (`+6%` → `1.06`, `1.0` → `1`,
+  `-5%` → `0.95`); a tempo nobody configured sends no speed at all;
+* the tone and the volume travel in the same hint set — `pitchShift` in hertz
+  (`+12Hz` → `12`) and `volume` as a multiplier (`+10%` → `1.1`). Both are
+  named by the service's own descriptor, and both are clamped into the
+  service's domain (the tone to ±40 Hz, the multiplier to 0.25–4);
+* the folder the key works in is a query parameter (`folderId`), never a body
+  field;
+* the rpc is server-streaming, so the answer is a set of chunks and the parser
+  takes the audio out of every shape it may arrive in — a single chunk
+  (`audioChunk.data`), the older `result.audioChunk.data` envelope, an array of
+  chunks, newline-delimited chunks, a chunk that carries its type —
+  concatenating them in the order they arrived;
+* the bytes are decoded into the same MP3 cache every other provider writes into, so
+  `/speak`, the audio route and the card cannot tell the providers apart. With
+  no key set, the provider is not used at all and the local CLI stays in charge.
+* a non-2xx answer fails with a message naming the status and the service's own
+  error text. A 403 (or a body mentioning `PermissionDenied`) says in plain
+  words that **the key has no rights on the folder** and that the SpeechKit
+  role has to be granted to it. **The key never appears in an error message** —
+  it is redacted out of the service's own text as well.
+
+### The Google provider
+
+Google Cloud Text-to-Speech is spoken of separately for the same reason: it
+has its own REST shape, and its own idea of what a voice and a tone are.
+
+```
+POST https://texttospeech.googleapis.com/v1/text:synthesize?key=<googleApiKey>
+Content-Type: application/json
+{"input": {"text": "..."}, "voice": {"languageCode": "ru-RU", "name": "ru-RU-Wavenet-A"}, "audioConfig": {"audioEncoding": "MP3", "speakingRate": 1.06, "pitch": 1.01, "volumeGainDb": 0.83}}
+```
+
+The answer is one JSON object whose `audioContent` is the whole file in base64 —
+not a stream, so it is read once and decoded whole. The key rides in the query
+string, which is the shape the service documents for a server-side call
+authenticated by an API key.
+
+* the voice is the service's own id: `ru-RU-Wavenet-A` … `ru-RU-Wavenet-D` and
+  `ru-RU-Standard-A` / `ru-RU-Standard-B`. A name the service does not know is
+  never sent — the card offers only names that exist;
+* `languageCode` is fixed to `ru-RU`: the voices offered are the Russian ones,
+  and a voice name alone would let the service pick another language;
+* the tempo travels as `speakingRate` (`+6%` → `1.06`), the same multiplier the
+  other providers use;
+* the tone travels in **semitones**, not in hertz, so the plugin's `+12Hz` is
+  converted against a nominal 200 Hz reference: `12 * log2(1 + 12/200)` ≈ 1.01
+  semitones. The reference is named in the code and the conversion is an
+  approximation, not an exact inverse;
+* the volume travels as `volumeGainDb`: `+10%` of amplitude is
+  `20 * log10(1.1)` ≈ 0.83 dB;
+* a 400 or a 403 fails with a message saying in plain words that the key has to
+  be checked and that Text-to-Speech has to be enabled in its project. **The
+  key never appears in an error message**;
+* with no key set, the provider is not used at all and the local CLI stays in
+  charge — the same rule the other providers follow.
+
+### The free Google provider
+
+The fifth provider needs **nothing**: no key, no billing, no settings. It speaks
+to the route the translate page itself uses, and it answers MPEG audio:
+
+```
+GET https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ru&q=<text>
+```
+
+* it is **not a documented API** — it is the web page's own endpoint, and it may
+  change or close without notice. The plugin says so rather than pretending the
+  route is a contract;
+* the route takes the text in a query string and refuses a long one, so the
+  narration is cut into pieces of at most 200 characters, **on a word boundary**
+  (a half-word is read as a half-word), and the pieces are concatenated in
+  reading order. Verified live: a 262-character text became one 184 320-byte MP3;
+* it has **one Russian voice** and no tempo or tone: the sliders do not shape
+  it. The card says that in plain words instead of silently ignoring them;
+* it sounds **worse** than the local CLI — it is the low-bitrate mono voice of
+  the translate page, without the neural prosody of `edge-tts`. Its job is to
+  be there when the local CLI is not: a machine with no `edge-tts` and no key
+  still speaks. It is the last rung, not the daily choice;
+* the bytes land in the same MP3 cache every other provider writes into.
 
 ### The request
 
@@ -277,9 +399,9 @@ the slot back.
 
 Only fields the namespace declares (`SETTINGS_FIELDS` in `lib/config.js`) can
 shadow the plugin row's config: **`preset`**, **`rate`**, **`pitch`**,
-**`voice`**, **`stripCode`**, **`autoPreset`**, **`dictionary`**,
+**`voice`**, **`stripCode`**, **`autoPreset`**, **`yoMode`**, **`dictionary`**,
 **`userPresets`**, **`spectrum`**, **`ttsProvider`**, **`customBaseUrl`**,
-**`customApiKey`**, **`customModel`**. A
+**`customApiKey`**, **`customModel`**, **`yandexApiKey`**, **`yandexVoice`**. A
 hand-written key outside that set in the settings document is ignored, so the
 document cannot be used to smuggle a `binPath` or `cacheDir` override past the
 composition layer.
@@ -293,6 +415,35 @@ plugin's own is involved.
 representation the plugin row uses, so both layers share one cache key. The
 dictionary stores only terms whose reading differs from the built-in table;
 resetting a row removes the override, which is what brings the default back.
+
+## The letter `ё`, and the `yoMode` switch
+
+The Russian voices of the Edge service read `ё` as `йе` — a palatal `е` with a
+`й` in front of it — so `приём` comes out as `прийем` and the stress of the
+word lands nowhere. The letter is therefore written out before the text
+reaches the voice, and **how** it is written out is the user's choice:
+
+| `yoMode` | What happens | What the voice says |
+| --- | --- | --- |
+| `as-is` (default) | the letter stays | `приём` → `приём`, and the Edge Russian voices read it as it is written |
+| `plain` | the dots are dropped | `приём` → `прием` |
+| `spelled` | the letter is written out phonetically | `приём` → `прийом`, `всё` → `всьо` |
+
+The written-out spelling follows the Russian phonology: in the middle of a
+word, after a soft consonant, the `ё` is `[jO]` (`приём` → `прийом`); at the
+start of a word or after a hard consonant it is `[ʲO]` (`всё` → `всьо`, `нёбо`
+→ `ньобо`, `ушёл` → `ушьол`); a `й` before the letter is not doubled (`моё` →
+`мойо`), and the hard sign is dropped the way a reader drops it (`съёмка` →
+`сьомка`).
+
+`as-is` is the default because the Russian voices of the Edge service read the
+letter correctly, and the user listened and called it perfect. The
+written-out spelling is the mode for a voice that does not — and it changes
+the words where the letter follows a hard consonant (`всё` → `всьо`, `ушёл` →
+`ушьол`), which is why it is not the default. That trade-off is why the
+switch exists at all: only an ear can settle it.
+
+The Yandex provider needs none of this — its Russian voices read `ё` as `ё`.
 
 ## Code, tables, and the `stripCode` switch
 
@@ -342,31 +493,41 @@ never changes the voice, and a tempo or a tone the user pinned explicitly still
 wins over it (field by field). The background warming of the remaining chunks
 carries the same override, so the whole message is spoken with one voice.
 
-## The visualization inside the message button
+## The visualization while the voice plays
 
 `spectrum` (default **`bars`**, a card dropdown, also settable in the plugin
-row) decides what the speaker button shows **while that message's own voice
-plays**. The allow-list lives in `lib/config.js` (`SPECTRUM_VARIANTS`) and the
-host reports it on `GET /dsh-voice-v/config` as `spectrumVariants`; the card
-renders what the host offers.
+row) decides what the page shows **while that message's own voice plays**. The
+allow-list lives in `lib/config.js` (`SPECTRUM_VARIANTS`) and the host reports
+it on `GET /dsh-voice-v/config` as `spectrumVariants`; the card renders what the
+host offers.
 
-| id | card | what it is |
-|---|---|---|
-| `off` | Выключено | nothing is shown |
-| `bars` | Спектр | a real frequency spectrum, drawn from the audio |
-| `wave` | Волна | a real oscilloscope, drawn from the audio |
-| `pulse` | Пульс | a pulsing dot — pure CSS, no analysis |
-| `dots` | Точки | three bouncing dots — pure CSS, no analysis |
+| id | card | what it is | where |
+|---|---|---|---|
+| `off` | Выключено | nothing is shown | — |
+| `bars` | Спектр | a real frequency spectrum, drawn from the audio | across the composer |
+| `wave` | Волна | a real oscilloscope, drawn from the audio | inside the button |
+| `oscillo` | Осциллограмма | a live time-domain trace, drawn from the audio | across the composer |
+| `pulse` | Пульс | a pulsing dot — pure CSS, no analysis | inside the button |
+| `dots` | Точки | three bouncing dots — pure CSS, no analysis | inside the button |
 
-The visualization lives **inside the message's own button**, in the place of
-the speaker glyph: the same 15 px box, the same colour (`currentColor`, so it
-follows the button's own `data-phase` colour), no frame, no shadow, no label.
-The box never changes size, so nothing around it moves when the visualization
-comes or goes. The button keeps its `data-phase` and its click-to-stop
-behaviour; the visualization is gone the moment the sound ends, fails, is
-stopped, or is taken away by another message.
+Three of them are drawn from the audio itself, and where they live follows the
+room they need. `wave`, `pulse` and `dots` live **inside the message's own
+button**, in the place of the speaker glyph: the same 15 px box, the same colour
+(`currentColor`, so it follows the button's own `data-phase` colour), no frame,
+no shadow, no label. The box never changes size, so nothing around it moves
+when the visualization comes or goes.
 
-The two analysed variants read the audio through the Web Audio API:
+`bars` and `oscillo` need the width a 15 px box does not have, so they are
+drawn on one wide strip that rides the top edge of the composer card, across
+the full width of the field: the spectrum as a row of bars, `oscillo` as a
+single live trace. The button keeps its stop glyph while they run, the strip
+takes no pointer events, and it takes no room at all while nothing sounds.
+
+Either way the button keeps its `data-phase` and its click-to-stop behaviour;
+the visualization is gone the moment the sound ends, fails, is stopped, or is
+taken away by another message.
+
+The three analysed variants read the audio through the Web Audio API:
 `AudioContext` → `createMediaElementSource` → `createAnalyser` →
 `destination`. **The sound always comes first.** The context is created inside
 the click, where the browser still lets it start, and the element is re-routed
@@ -485,7 +646,7 @@ These never appear in the settings card:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `binPath` | local `edge-tts.exe` | `edge-tts` executable |
+| `binPath` | `edge-tts` (resolved through `PATH`) | `edge-tts` executable |
 | `cacheDir` | `~/.dsh/cache/dsh-voice-v` | MP3 cache folder |
 | `volume` | `+0%` | passed to `--volume` |
 | `maxChunkChars` | `320` | characters per synthesized chunk |
@@ -585,9 +746,10 @@ npm publish --access public
 
 ```bash
 node scripts/build-client.mjs   # client bundle gate
-node test/synth.mjs             # 39 checks: text, chunking, config, cache, routes, session lookup
-node test/settings.mjs          # 102 checks: presets, user presets, dictionary, stripCode, /preview, live settings, the tone of the message, the voice catalogue, the visualization, the rendered card, the shared sound slot
-npm test                        # both
+node test/synth.mjs             # 95 checks: text, chunking, config, cache, routes, session lookup, and the Yandex, Google and custom providers
+node test/settings.mjs          # 121 checks: presets, user presets, dictionary, yoMode, stripCode, /preview, live settings, the tone of the message, the voice catalogue, the visualization, the rendered card, the shared sound slot
+node test/client.mjs            # 21 checks: both slots registered against a real Cordis context and a real SlotCore registry
+npm test                        # all four
 ```
 
 `lib/client.js` is hand-written directly in the lazy-CJS bundle protocol
@@ -619,6 +781,42 @@ To replay the id-addressed message lookup against a genuine transcript:
 $env:DSH_VOICE_V_SESSION_FILE = "$HOME/.dsh/sessions/<project>/<session>/session.v4.jsonl.zstd"
 node test/synth.mjs
 ```
+
+## Changelog
+
+### 0.3.0
+
+- **Four synthesis providers next to `edge-tts`**: an OpenAI-compatible endpoint
+  (any `/v1/audio/speech` server), **Yandex SpeechKit** v3, **Google Cloud TTS**
+  and a keyless **free Google** route that keeps the plugin speaking on a machine
+  with no `edge-tts` and no key. `edge-tts` stays the default and its argv, cache
+  and errors are unchanged.
+- **The letter `ё`** gained a switch (`yoMode`: `as-is` / `plain` / `spelled`),
+  with the written-out spelling following Russian phonology.
+- **The voice catalogue is data**, reported by the host as `voiceList`; the
+  bundle hard-codes no voice and the dropdown grows a **«Свой голос…»** entry.
+- **Both halves re-seated**: the card now lives in `plugins.bundle.config`
+  (keyed on the package name) and is mounted through `configForms.whileServed`,
+  so it appears whenever the Host starts serving the namespace — not only when
+  the plugin mounted first — and it is withdrawn when the namespace stops.
+- **`test/client.mjs`**: the browser half finally has tests. The bundle is
+  evaluated the way the shell loads it, against a real Cordis context and a real
+  `SlotCore` registry, so a slot that fails to register is a red test instead of
+  two hours of staring at the GUI.
+- **No machine-specific path in the repository**: `binPath` now defaults to the
+  bare `edge-tts`, resolved through `PATH`; `DSH_VOICE_V_EDGE_TTS` overrides it.
+
+### 0.2.0
+
+- Custom TTS endpoint (base URL, key, model) with the OpenAI `/audio/speech`
+  shape, the user's own presets (`userPresets`), the tone-of-message preset, and
+  the visualization inside the message button and across the composer.
+
+### 0.1.0
+
+- Read-aloud speaker button under every assistant message, voiced by `edge-tts`,
+  with the settings card: voices, presets, tempo, pitch, the pronunciation
+  dictionary and the code-stripping switch.
 
 ## License
 

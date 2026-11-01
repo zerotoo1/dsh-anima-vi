@@ -610,6 +610,11 @@ await test('the user section may only shadow the fields the namespace owns', () 
     'customBaseUrl',
     'customApiKey',
     'customModel',
+    'yandexApiKey',
+    'yandexVoice',
+    'googleApiKey',
+    'googleVoice',
+    'yoMode',
   ]);
 });
 
@@ -636,7 +641,7 @@ await test('preview options use the body, then the preset, then the defaults', (
 });
 
 await test('the settings schema declares exactly the namespace fields', async () => {
-  const loaded = loadSchemaFactory();
+  const loaded = await loadSchemaFactory();
   if (typeof loaded.z?.object !== 'function') {
     // No resolvable schemastery in this deployment: the graceful path is the
     // only one available, and `createLiveSettings` is checked for it below.
@@ -647,13 +652,21 @@ await test('the settings schema declares exactly the namespace fields', async ()
   const json = schema.toJSON();
   const declared = Object.keys(json.refs[json.uid].dict).sort();
   assert.deepEqual(declared, [...SETTINGS_FIELDS].sort());
-  // `dsh-settings`' `volatileForm` keeps only the volatile children. A plain
-  // field would therefore not merely hide itself — it would drop the whole
-  // entry from the form, and the card would never mount.
+  // The declarative settings service derives the card's form from the
+  // volatile fields only: a field without the marker is invisible to it.
   for (const field of SETTINGS_FIELDS) {
     assert.equal(schema.dict[field]?.meta?.volatile, true, `${field} must be volatile`);
   }
-  const resolved = schema({ dictionary: { redscript: 'ред скрипт' } });
+  // The registered schema is the plain one: the imperative service resolves
+  // the section into ordinary values, and a volatile field would resolve into
+  // a live reference instead of a value.
+  const plain = buildSettingsSchema(loaded.z, { volatile: false });
+  for (const field of SETTINGS_FIELDS) {
+    assert.notEqual(plain.dict[field]?.meta?.volatile, true, `${field} must not be volatile`);
+  }
+  // The plain schema resolves into ordinary values: a volatile field would
+  // resolve into a live reference instead, and the reader unwraps those.
+  const resolved = plain({ dictionary: { redscript: 'ред скрипт' } });
   assert.equal(resolved.preset, 'zhivoy');
   assert.equal(resolved.stripCode, true);
   assert.equal('rate' in resolved, false, 'an unset rate must stay absent so the preset answers');
@@ -687,6 +700,10 @@ function fakeSchemaFactory(options = {}) {
       schema.meta.volatile = true;
       return schema;
     };
+    schema.role = (value) => {
+      schema.meta.role = value;
+      return schema;
+    };
     return schema;
   };
   const factory = {
@@ -704,13 +721,13 @@ function fakeSchemaFactory(options = {}) {
   return factory;
 }
 
-await test('the settings schema declares a volatile user-preset pool', () => {
+await test('the settings schema declares the user-preset pool', () => {
   const schema = buildSettingsSchema(fakeSchemaFactory());
   const field = schema.dict.userPresets;
   assert.ok(field !== undefined, 'the schema must declare the user preset pool');
-  // `volatileForm` keeps only the volatile children: a plain field would drop
-  // the whole entry from the form, and the card would never mount.
-  assert.equal(field.meta.volatile, true, 'the pool must be volatile so the Host accepts a write');
+  // The pool is a dict, and a dict carries no form of its own: the field
+  // itself must carry the marker, or the declarative service would not see it.
+  assert.equal(field.meta.volatile, true, 'the pool must be volatile');
   assert.equal(field.type, 'dict', 'the pool is a record of presets');
   assert.equal(field.inner.type, 'object', 'one preset is an object');
   assert.deepEqual(Object.keys(field.inner.dict).sort(), ['label', 'pitch', 'rate', 'voice']);
@@ -719,23 +736,16 @@ await test('the settings schema declares a volatile user-preset pool', () => {
   }
 });
 
-await test('the settings schema accepts a user preset and the live reader sees it', () => {
-  const harness = makeVolatileHarness();
-  if (harness === null) {
-    // No volatile-capable schemastery in this deployment: the graceful path is
-    // the only one available, and the shape itself is checked above.
-    assert.ok(true);
-    return;
-  }
-  const { config, write } = harness;
-  const loaded = loadSchemaFactory();
-  const schema = buildSettingsSchema(loaded.z);
+await test('the settings schema accepts a user preset and the live reader sees it', async () => {
+  const { ctx, config, write } = makeSettingsHarness();
+  const loaded = await loadSchemaFactory();
+  const schema = buildSettingsSchema(loaded.z, { volatile: false });
   const parsed = schema({ userPresets: { 'user-moy': { label: 'Мой', rate: '+5%', pitch: '+2Hz' } } });
   assert.deepEqual(parsed.userPresets, { 'user-moy': { label: 'Мой', rate: '+5%', pitch: '+2Hz' } });
 
-  // The Loader commits a save into the reference, and the live reader sees it.
+  // A write into the user's layer, and the live reader sees it.
   write('userPresets', { 'user-moy': { label: 'Мой', rate: '+5%', pitch: '+2Hz' } });
-  const live = createLiveSettings({}, config);
+  const live = createLiveSettings(ctx, config);
   assert.equal(live().userPresets['user-moy'].label, 'Мой');
   assert.equal(live().presets['user-moy'].rate, '+5%');
   assert.equal(live().presets['user-moy'].pitch, '+2Hz');
@@ -743,20 +753,18 @@ await test('the settings schema accepts a user preset and the live reader sees i
 
 console.log('\ncustom TTS endpoint (the settings surface)');
 
-await test('the schema declares the custom endpoint as four volatile fields', () => {
+await test('the schema declares the custom endpoint and the Yandex provider', async () => {
   const schema = buildSettingsSchema(fakeSchemaFactory());
 
   const provider = schema.dict.ttsProvider;
   assert.ok(provider !== undefined, 'the provider must be declared');
-  // `volatileForm` keeps only the volatile children: a plain field would drop
-  // the whole entry from the form, and the card would never mount.
-  assert.equal(provider.meta.volatile, true, 'the provider must be volatile so the Host accepts a write');
+  assert.equal(provider.meta.volatile, true, 'the provider must be volatile');
   assert.equal(provider.meta.default, 'edge', 'edge-tts is the default provider');
   assert.equal(provider.meta.loose, true, 'an unknown provider must fall back, not fail the whole entry');
   assert.equal(provider.type, 'union');
   assert.deepEqual(
     provider.list.map((entry) => entry.value),
-    ['edge', 'custom'],
+    ['edge', 'custom', 'yandex', 'google', 'google-free'],
   );
 
   for (const field of ['customBaseUrl', 'customApiKey', 'customModel']) {
@@ -766,8 +774,32 @@ await test('the schema declares the custom endpoint as four volatile fields', ()
     assert.equal(declared.type, 'string');
   }
 
+  // The Yandex provider: a key and a voice.
+  const yandexKey = schema.dict.yandexApiKey;
+  assert.ok(yandexKey !== undefined, 'the Yandex key must be declared');
+  assert.equal(yandexKey.meta.volatile, true, 'the Yandex key must be volatile');
+  assert.equal(yandexKey.meta.role, 'secret', 'the Yandex key is a secret');
+  const yandexVoice = schema.dict.yandexVoice;
+  assert.ok(yandexVoice !== undefined, 'the Yandex voice must be declared');
+  assert.equal(yandexVoice.meta.volatile, true, 'the Yandex voice must be volatile');
+  assert.equal(yandexVoice.meta.default, 'marina', 'marina is the default voice');
+
+  // The Google provider: a key and a voice, the same shape as the Yandex one.
+  const googleKey = schema.dict.googleApiKey;
+  assert.ok(googleKey !== undefined, 'the Google key must be declared');
+  assert.equal(googleKey.meta.volatile, true, 'the Google key must be volatile');
+  assert.equal(googleKey.meta.role, 'secret', 'the Google key is a secret');
+  const googleVoice = schema.dict.googleVoice;
+  assert.ok(googleVoice !== undefined, 'the Google voice must be declared');
+  assert.equal(googleVoice.meta.volatile, true, 'the Google voice must be volatile');
+  assert.equal(googleVoice.meta.default, 'ru-RU-Wavenet-A', 'Wavenet-A is the default voice');
+  assert.deepEqual(
+    yandexVoice.list.map((entry) => entry.value),
+    ['marina', 'ermil', 'pavel', 'male', 'jane'],
+  );
+
   // The real schemastery, when this deployment can resolve one.
-  const loaded = loadSchemaFactory();
+  const loaded = await loadSchemaFactory();
   if (typeof loaded.z?.object === 'function') {
     const real = buildSettingsSchema(loaded.z);
     assert.equal(real.dict.ttsProvider.meta.volatile, true);
@@ -775,6 +807,8 @@ await test('the schema declares the custom endpoint as four volatile fields', ()
     for (const field of ['customBaseUrl', 'customApiKey', 'customModel']) {
       assert.equal(real.dict[field].meta.volatile, true, `${field} must be volatile`);
     }
+    assert.equal(real.dict.yandexApiKey.meta.volatile, true);
+    assert.equal(real.dict.yandexVoice.meta.volatile, true);
   }
 });
 
@@ -914,44 +948,75 @@ await test('the edge-tts override is left exactly as it was', async () => {
 console.log('\nlive settings');
 
 /**
- * Build a plugin row config the way the Loader hands it to the fiber: the six
- * card-owned fields are `cosmokit` references — the Loader commits a save into
- * them in place, so the next sentence reads the new value without a remount —
- * and the deployment keys sit beside them as plain values.
- * @returns `{ config, write }`, or null when no volatile-capable schemastery
- *   resolves in this deployment.
+ * A stand-in for the Host's 0.1.x settings service.
+ *
+ * The service owns one document per namespace: the plugin's row config is the
+ * base layer, the user's document the layer above it, and a write through the
+ * scope lands in the user's layer. The stub keeps the two layers apart so the
+ * test can see which one a value came from.
+ * @returns The stub service.
  */
-function makeVolatileHarness() {
-  const loaded = loadSchemaFactory();
-  if (typeof loaded.z?.object !== 'function') return null;
-  const schema = buildSettingsSchema(loaded.z);
-  const config = schema({});
-  const write = (field, value) => {
-    const ref = config[field];
-    if (ref === undefined || typeof ref.get !== 'function') {
-      throw new Error(`field ${field} is not a volatile reference`);
-    }
-    ref[Symbol.for('cosmokit.volatile.write')](value);
+function makeSettingsService() {
+  const state = { user: {}, watchers: [], namespaces: [] };
+  const service = {
+    state,
+    register(namespace, schema, options = {}) {
+      state.namespaces.push({ namespace, schema, base: options.base });
+      const scope = {
+        get: () => ({ ...(options.base ?? {}), ...state.user }),
+        watch(callback) {
+          state.watchers.push(callback);
+        },
+        set(field, value) {
+          state.user[field] = value;
+        },
+        unset(field) {
+          delete state.user[field];
+        },
+      };
+      return scope;
+    },
   };
-  return { config, write };
+  return service;
 }
 
-await test('the live reader reads the volatile fields the Loader committed', async () => {
-  const harness = makeVolatileHarness();
-  if (harness === null) {
-    assert.ok(true);
-    return;
-  }
-  const { config, write } = harness;
-  const live = createLiveSettings({}, config);
+/**
+ * Build the pair the plugin is mounted with: a plugin row config and the Host
+ * context whose settings service the plugin publishes its namespace to.
+ * @param options - `id` of the Loader row the plugin is mounted as.
+ * @returns `{ ctx, service, config, write }`.
+ */
+function makeSettingsHarness(options = {}) {
+  const service = makeSettingsService();
+  const config = {
+    preset: 'zhivoy',
+    stripCode: true,
+    autoPreset: false,
+    dictionary: {},
+  };
+  const ctx = {
+    fiber: { entry: { options: { id: options.id ?? SETTINGS_NAMESPACE } } },
+    inject(services, callback) {
+      callback({ settings: service });
+    },
+  };
+  const write = (field, value) => {
+    service.state.user[field] = value;
+  };
+  return { ctx, service, config, write };
+}
+
+await test('the live reader reads the values the settings service serves', () => {
+  const { ctx, config, write } = makeSettingsHarness();
+  const live = createLiveSettings(ctx, config);
   assert.equal(live.settingsRegistered(), true);
-  assert.equal(live().rate, '+0%', 'the built-in default answers first');
-  assert.equal(live().pitch, '+0Hz');
+  assert.equal(live().rate, '+6%', 'the row config answers first');
+  assert.equal(live().pitch, '+12Hz');
   assert.equal(live().stripCode, true);
 
   write('rate', '-20%');
-  assert.equal(live().rate, '-20%', 'a committed write is visible on the next read');
-  assert.equal(live().pitch, '+0Hz', 'the untouched pitch still follows the preset');
+  assert.equal(live().rate, '-20%', 'a written value is visible on the next read');
+  assert.equal(live().pitch, '+12Hz', 'the untouched pitch still follows the preset');
 
   write('rate', undefined);
   write('preset', 'ustaly');
@@ -968,24 +1033,19 @@ await test('the live reader reads the volatile fields the Loader committed', asy
   assert.equal(live().stripCode, false);
 
   write('spectrum', 'wave');
-  assert.equal(live().spectrum, 'wave', 'the committed variant is visible on the next read');
+  assert.equal(live().spectrum, 'wave', 'the written variant is visible on the next read');
 
   write('dictionary', { redscript: 'ред скрипт' });
   assert.equal(live().dictionary.redscript, 'ред скрипт');
   assert.equal(live().dictionary.TweakDB, 'твик-ди-би');
 });
 
-await test('a deployment key is read as it is, and the card never owns it', async () => {
-  const harness = makeVolatileHarness();
-  if (harness === null) {
-    assert.ok(true);
-    return;
-  }
-  const { config } = harness;
+await test('a deployment key is read as it is, and the card never owns it', () => {
+  const { ctx, config } = makeSettingsHarness();
   config.binPath = 'C:/real/edge-tts';
   config.cacheDir = 'C:/cache';
   config.timeoutMs = 1234;
-  const live = createLiveSettings({}, config);
+  const live = createLiveSettings(ctx, config);
   assert.equal(live().binPath, 'C:/real/edge-tts');
   assert.equal(live().cacheDir, 'C:/cache');
   assert.equal(live().timeoutMs, 1234);
@@ -994,34 +1054,30 @@ await test('a deployment key is read as it is, and the card never owns it', asyn
   assert.equal(SETTINGS_FIELDS.includes('timeoutMs'), false);
 });
 
-await test('the namespace is served only under the row id it declares', async () => {
-  const harness = makeVolatileHarness();
-  if (harness === null) {
-    assert.ok(true);
-    return;
-  }
-  const { config } = harness;
+await test('the namespace is served only under the row id it declares', () => {
+  const { ctx, config, service } = makeSettingsHarness();
   const warnings = [];
   const logger = { warn: (message) => warnings.push(message) };
 
-  const right = createLiveSettings({ fiber: { entry: { options: { id: SETTINGS_NAMESPACE } } } }, config, { logger });
+  const right = createLiveSettings(ctx, config, { logger });
   assert.equal(right.settingsRegistered(), true);
   assert.equal(warnings.length, 0, 'the right row id warns about nothing');
+  assert.equal(service.state.namespaces.length, 1, 'the namespace is registered once');
+  assert.equal(service.state.namespaces[0].namespace, SETTINGS_NAMESPACE);
 
   // A row the Host keys under another id does not serve this namespace.
-  const wrong = createLiveSettings({ fiber: { entry: { options: { id: 'voice-v' } } } }, config, { logger });
+  const wrong = createLiveSettings(
+    { fiber: { entry: { options: { id: 'voice-v' } } }, inject: ctx.inject },
+    config,
+    { logger },
+  );
   assert.equal(wrong.settingsRegistered(), false, 'a row under another id does not serve the namespace');
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /dsh-voice-v/);
 });
 
-await test('a nested row is judged by the id the Host keys the namespace by', async () => {
-  const harness = makeVolatileHarness();
-  if (harness === null) {
-    assert.ok(true);
-    return;
-  }
-  const { config } = harness;
+await test('a nested row is judged by the id the Host keys the namespace by', () => {
+  const { config } = makeSettingsHarness();
   const warnings = [];
   const logger = { warn: (message) => warnings.push(message) };
 
@@ -1031,7 +1087,12 @@ await test('a nested row is judged by the id the Host keys the namespace by', as
   // Reading the composed path would report a mismatch for a row the Host does
   // serve, so the raw id is the one that counts.
   const nested = createLiveSettings(
-    { fiber: { entry: { id: 'include:' + SETTINGS_NAMESPACE, options: { id: SETTINGS_NAMESPACE } } } },
+    {
+      fiber: { entry: { id: 'include:' + SETTINGS_NAMESPACE, options: { id: SETTINGS_NAMESPACE } } },
+      inject(services, callback) {
+        callback({ settings: makeSettingsService() });
+      },
+    },
     config,
     { logger },
   );
@@ -1043,7 +1104,7 @@ await test('the schema loader resolves through the DSH home or reports what is m
   const anchors = candidateAnchors();
   assert.ok(anchors.length > 0);
   assert.ok(anchors.every((anchor) => anchor.endsWith('x.js')));
-  const loaded = loadSchemaFactory();
+  const loaded = await loadSchemaFactory();
   if (loaded.missing !== undefined) {
     assert.ok(loaded.missing.length > 0);
     assert.ok(Array.isArray(loaded.reasons));
@@ -1051,17 +1112,17 @@ await test('the schema loader resolves through the DSH home or reports what is m
   }
   assert.equal(typeof loaded.z.object, 'function');
   assert.equal(
-    typeof loaded.z.string().volatile,
+    typeof loaded.z.string().description,
     'function',
-    'the resolved copy must be able to mark fields volatile',
+    'the resolved copy must be able to describe a field',
   );
   assert.equal(resolvePeerPackage('@deepseek-ai/definitely-not-a-package', candidateAnchors()), null);
 });
 
-await test('a copy of schemastery that cannot mark fields volatile is rejected, not used', async () => {
-  // A resolvable-but-wrong copy must not be accepted: without `volatile()` the
-  // Loader would commit a card write as an ordinary restart, and
-  // `dsh-settings` would describe no form at all.
+await test('a copy of schemastery without the needed constructs is rejected, not used', async () => {
+  // A resolvable-but-wrong copy must not be accepted: the schema would be
+  // built by a factory that cannot express the namespace, and the settings
+  // service would receive something it cannot validate.
   const root = await mkdtemp(join(tmpdir(), 'dsh-voice-v-schema-'));
   const packageDir = join(root, 'node_modules', '@deepseek-ai', 'schemastery');
   await mkdir(packageDir, { recursive: true });
@@ -1089,24 +1150,24 @@ await test('a copy of schemastery that cannot mark fields volatile is rejected, 
   assert.notEqual(resolvedWrong, null, 'the fixture must be resolvable, or the test proves nothing');
 
   resetPeerCache();
-  const rejected = loadSchemaFactory({ anchors: [anchor] });
-  assert.equal(rejected.z, undefined, 'a copy without volatile() must not be accepted');
+  const rejected = await loadSchemaFactory({ anchors: [anchor] });
+  assert.equal(rejected.z, undefined, 'a copy without the needed constructs must not be accepted');
   assert.deepEqual(rejected.missing, ['@deepseek-ai/schemastery']);
-  assert.match(rejected.reasons.join(' '), /cannot mark fields volatile/);
+  assert.match(rejected.reasons.join(' '), /cannot build a namespace schema/);
 
   // Whatever this deployment offers, the real anchors must not be poisoned by
   // the rejected copy above.
   resetPeerCache();
-  const real = loadSchemaFactory();
+  const real = await loadSchemaFactory();
   assert.notEqual(real.path, resolvedWrong);
 
   await rm(root, { recursive: true, force: true });
 });
 
-await test('a copy that can mark fields volatile is accepted', async () => {
+await test('a copy with the needed constructs is accepted', async () => {
   // The mirror of the rejection above: the profile's own interception layer may
   // hold an older schemastery, and the host's installation a newer one. The
-  // probe must take the copy that can actually mark fields volatile.
+  // probe must take the copy that can build the namespace.
   const root = await mkdtemp(join(tmpdir(), 'dsh-voice-v-volatile-'));
   const packageDir = join(root, 'node_modules', '@deepseek-ai', 'schemastery');
   await mkdir(packageDir, { recursive: true });
@@ -1136,7 +1197,7 @@ await test('a copy that can mark fields volatile is accepted', async () => {
   await writeFile(anchor, '');
 
   resetPeerCache();
-  const loaded = loadSchemaFactory({ anchors: [anchor] });
+  const loaded = await loadSchemaFactory({ anchors: [anchor] });
   assert.equal(loaded.missing, undefined, 'a volatile-capable copy must be accepted');
   assert.equal(typeof loaded.z.string().volatile, 'function');
 
@@ -1450,12 +1511,12 @@ await test('the tone analysis explains the choice it made', () => {
   assert.equal(analysis.candidates[0].score, 3);
 });
 
-await test('the schema declares autoPreset as a volatile boolean that defaults to on', () => {
+await test('the schema declares autoPreset as a boolean that defaults to on', async () => {
   const schema = buildSettingsSchema(fakeSchemaFactory());
   const field = schema.dict.autoPreset;
   assert.ok(field !== undefined, 'the schema must declare the automatic preset');
   assert.equal(field.type, 'boolean');
-  assert.equal(field.meta.volatile, true, 'the switch must be volatile so the Host accepts a write');
+  assert.equal(field.meta.volatile, true, 'the switch must be volatile');
   assert.equal(field.meta.default, true);
   assert.equal(DEFAULT_AUTO_PRESET, true);
 
@@ -1465,21 +1526,21 @@ await test('the schema declares autoPreset as a volatile boolean that defaults t
   assert.equal(resolveVoiceConfig({ autoPreset: false }).autoPreset, false);
   assert.equal(resolveVoiceConfig({ autoPreset: 'off' }).autoPreset, false);
 
-  const loaded = loadSchemaFactory();
+  const loaded = await loadSchemaFactory();
   if (typeof loaded.z?.object === 'function') {
-    const real = buildSettingsSchema(loaded.z);
+    // The plain schema resolves into ordinary values; a volatile field
+    // would resolve into a live reference instead.
+    const real = buildSettingsSchema(loaded.z, { volatile: false });
     assert.equal(real({}).autoPreset, true);
     assert.equal(real({ autoPreset: false }).autoPreset, false);
   }
 });
 
-await test('the schema declares the visualization variant as a volatile field with the documented default', () => {
+await test('the schema declares the visualization variant with the documented default', async () => {
   const schema = buildSettingsSchema(fakeSchemaFactory());
   const field = schema.dict.spectrum;
   assert.ok(field !== undefined, 'the schema must declare the visualization variant');
-  // `volatileForm` keeps only the volatile children: a plain field would drop
-  // the whole entry from the form, and the card would never mount.
-  assert.equal(field.meta.volatile, true, 'the variant must be volatile so the Host accepts a write');
+  assert.equal(field.meta.volatile, true, 'the variant must be volatile');
   assert.equal(field.meta.default, DEFAULT_SPECTRUM, 'the default variant is the one the schema offers');
   assert.equal(DEFAULT_SPECTRUM, 'bars');
   assert.equal(field.meta.loose, true, 'an unknown variant must fall back, not fail the whole entry');
@@ -1492,7 +1553,7 @@ await test('the schema declares the visualization variant as a volatile field wi
   );
   assert.deepEqual(
     SPECTRUM_VARIANTS.map((variant) => variant.label),
-    ['Выключено', 'Спектр', 'Волна', 'Пульс', 'Точки'],
+    ['Выключено', 'Спектр', 'Волна', 'Осциллограмма', 'Пульс', 'Точки'],
   );
 
   // The live resolver: an unknown value falls back to the default instead of
@@ -1509,7 +1570,7 @@ await test('the schema declares the visualization variant as a volatile field wi
   assert.equal('binPath' in base, false);
   assert.equal(pickSettingsSection({ spectrum: 'pulse' }).spectrum, 'pulse');
 
-  const loaded = loadSchemaFactory();
+  const loaded = await loadSchemaFactory();
   if (typeof loaded.z?.object === 'function') {
     const real = buildSettingsSchema(loaded.z);
     assert.equal(real.dict.spectrum.meta.volatile, true);
@@ -1833,7 +1894,7 @@ await test('GET /config reports the visualization variants, and the manifest car
   );
   assert.deepEqual(
     payload.spectrumVariants.map((variant) => variant.label),
-    ['Выключено', 'Спектр', 'Волна', 'Пульс', 'Точки'],
+    ['Выключено', 'Спектр', 'Волна', 'Осциллограмма', 'Пульс', 'Точки'],
   );
 
   // The manifest is what the message button reads: the variant travels with
@@ -1893,8 +1954,9 @@ await test('GET /health reports the live switch as well', async () => {  const s
 
 console.log('\nplugin mount');
 
-await test('apply() registers the route and reads the volatile fields it was handed', async () => {
+await test('apply() registers the route and reads the fields it was handed', async () => {
   const routes = [];
+  const service = makeSettingsService();
   const ctx = {
     logger: { warn: () => {} },
     effect(fn, _label) {
@@ -1907,13 +1969,15 @@ await test('apply() registers the route and reads the volatile fields it was han
         return () => {};
       },
     },
+    fiber: { entry: { options: { id: SETTINGS_NAMESPACE } } },
+    inject(services, callback) {
+      callback({ settings: service });
+    },
   };
 
-  // The row config the Loader hands over: the card-owned fields are volatile
-  // references, the deployment keys are plain values.
-  const loaded = loadSchemaFactory();
-  const harness = typeof loaded.z?.object === 'function' ? makeVolatileHarness() : null;
-  const config = harness === null ? { preset: 'spokoiny' } : harness.config;
+  // The row config the Loader hands over: the card-owned fields and the
+  // deployment keys are plain values.
+  const config = { preset: 'spokoiny' };
   config.cacheDir = cacheDir;
   config.timeoutMs = 5000;
 
@@ -1928,17 +1992,58 @@ await test('apply() registers the route and reads the volatile fields it was han
   assert.equal(res.status, 200);
   const payload = res.json();
   assert.equal(payload.settingsNamespace, SETTINGS_NAMESPACE);
-  assert.equal(payload.settingsRegistered, harness !== null, 'the namespace is served only with a published Config');
+  assert.equal(payload.settingsRegistered, true, 'the namespace is registered with the settings service');
   assert.equal(payload.preset, 'spokoiny');
 
-  if (harness !== null) {
-    // A card write lands in the very reference the route reads, so the next
-    // request answers with the new value and no remount.
-    harness.write('preset', 'ustaly');
-    const after = await callRoute(routes[0].handler, { method: 'GET', url: '/dsh-voice-v/config' });
-    assert.equal(after.json().preset, 'ustaly', 'a committed write is visible on the next request');
-    assert.equal(after.json().rate, '-12%');
-  }
+  // A write into the user's layer lands in the document the route reads, so
+  // the next request answers with the new value and no remount.
+  service.state.user.preset = 'ustaly';
+  const after = await callRoute(routes[0].handler, { method: 'GET', url: '/dsh-voice-v/config' });
+  assert.equal(after.json().preset, 'ustaly', 'a written value is visible on the next request');
+  assert.equal(after.json().rate, '-12%');
+});
+
+await test('apply() serves the routes on the declarative host, where the row is the live value', async () => {
+  // The 0.1.7 settings service has NO `register`: the namespace is derived
+  // from the Loader row and the exported `Config`, and the row itself carries
+  // the folded user document. This is the host the studio runs, and the shape
+  // that once broke every route: the live reader pointed at a name that did
+  // not exist, so each request threw and the web server answered 400 with an
+  // empty body — which the browser reads as "request failed".
+  const routes = [];
+  const declarativeService = { describe: () => ({ namespaces: [] }) };
+  const ctx = {
+    logger: { warn: () => {} },
+    effect(fn, _label) {
+      fn();
+      return () => {};
+    },
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      },
+    },
+    fiber: { entry: { options: { id: SETTINGS_NAMESPACE } } },
+    inject(services, callback) {
+      callback({ settings: declarativeService });
+    },
+  };
+
+  const config = { preset: 'spokoiny' };
+  config.cacheDir = cacheDir;
+  config.timeoutMs = 5000;
+
+  const { apply } = await import('../lib/index.js');
+  apply(ctx, config);
+
+  assert.equal(routes.length, 1, 'the route is registered on the declarative host too');
+  const res = await callRoute(routes[0].handler, { method: 'GET', url: '/dsh-voice-v/config' });
+  assert.equal(res.status, 200, 'the config route answers on the declarative host');
+  assert.equal(res.json().preset, 'spokoiny', 'the row config is the live value');
+  const health = await callRoute(routes[0].handler, { method: 'GET', url: '/dsh-voice-v/health' });
+  assert.equal(health.status, 200, 'the health route answers on the declarative host');
+  assert.equal(health.json().ok, true);
 });
 
 await rm(cacheDir, { recursive: true, force: true });
@@ -2153,9 +2258,18 @@ function loadClientComponents(react, globals = {}) {
     if (specifier === 'react') return react;
     throw new Error(`unexpected require(${specifier})`);
   });
-  // The post-refactor browser contract: the card binds through the `configForms`
-  // service and registers into the plugin manager's `plugins.bundle.config`
-  // seat, which exists only while the Host serves the namespace.
+  // The browser contract of this host: the card binds the settings scope of
+  // its namespace through the `settingsScope` binder and registers into the
+  // `settings.plugin.item` seat of the Plugins settings surface.
+  //
+  // The context answers services by PROPERTY ACCESS, the way a cordis
+  // context does, and it has no `get` method: a context that answers `get`
+  // would hide a plugin that reaches for a service the wrong way. Unknown
+  // properties throw, exactly as a cordis context throws for a service it
+  // cannot see.
+  const services = {
+    settingsScope: { bind: () => scopeStub },
+  };
   const ctx = {
     slots: {
       inject(_name, factory) {
@@ -2168,26 +2282,39 @@ function loadClientComponents(react, globals = {}) {
         return () => {};
       },
     },
-    configForms: {
-      get: () => scopeStub,
-      whileServed(namespaces, register) {
-        return register(new Set(namespaces));
-      },
-    },
     effect(fn) {
       const disposer = fn();
       return typeof disposer === 'function' ? disposer : () => {};
     },
     inject(_services, callback) {
-      callback(ctx);
+      // A nested fiber is handed a context derived from the caller's own, so
+      // the services stay visible to it — the proxy, not the bare object.
+      callback(proxied);
     },
   };
-  clientExports.apply(ctx);
-  const card = mounted.find((entry) => entry.options.name === 'plugins.bundle.config');
+  // A cordis context resolves a service by property access and throws when
+  // the service is not visible from this fiber.
+  Object.defineProperty(ctx, 'services', { value: services, enumerable: false });
+  const proxied = new Proxy(ctx, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      if (prop in services) return services[prop];
+      throw new Error(`cannot get property "${String(prop)}" without inject`);
+    },
+  });
+  clientExports.apply(proxied);
+  const card = mounted.find((entry) => entry.options.name === 'settings.plugin.item');
   const button = mounted.find((entry) => entry.options.name === 'conversation.chat.assistant-actions');
+  const oscillo = mounted.find((entry) => entry.options.name === 'conversation.input.dock');
   assert.ok(card !== undefined, 'the settings card must register');
   assert.ok(button !== undefined, 'the speaker button must register');
-  return { card: card.component, button: button.component, audio: clientExports.__audio };
+  assert.ok(oscillo !== undefined, 'the composer trace must register');
+  return {
+    card: card.component,
+    button: button.component,
+    oscillo: oscillo.component,
+    audio: clientExports.__audio,
+  };
 }
 
 /**
@@ -2246,6 +2373,81 @@ async function mountComponent(component, props, harness) {
 async function mountCard(component, props, mini) {
   return mountComponent(component, props, mini);
 }
+
+await test('the card registers on the studio host, where the form service answers', () => {
+  // The studio (dsh 0.1.x) hands the card a shared form from the
+  // `configForms` service and has no `settingsScope` binder. The card must
+  // find the form without `ctx.get` — a cordis context has no such method,
+  // and reaching for one used to throw the whole registration away, so the
+  // settings never appeared on the plugin's page.
+  const clientPath = fileURLToPath(new URL('../lib/client.js', import.meta.url));
+  const source = readFileSync(clientPath, 'utf8');
+  const registrations = [];
+  const sandbox = {
+    window: { __ModuleLoader__: { load: (registration) => registrations.push(registration) } },
+    console,
+  };
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(source, sandbox, { filename: clientPath });
+  const clientExports = registrations[0].factory((specifier) => {
+    if (specifier === 'react') return { createElement: () => null, useState: () => [null, () => {}], useEffect: () => {}, useRef: () => ({ current: null }), useMemo: () => null, memo: (component) => component };
+    throw new Error(`unexpected require(${specifier})`);
+  });
+
+  const scopeStub = { getSnapshot: () => ({ status: 'loading' }), subscribe: () => () => {}, set: async () => {}, unset: async () => {} };
+  const mounted = [];
+  const services = {
+    configForms: {
+      get(namespace) {
+        assert.equal(namespace, 'dsh-voice-v');
+        return scopeStub;
+      },
+    },
+  };
+  const ctx = {
+    slots: {
+      inject(_name, factory) {
+        const produced = factory();
+        if (produced !== null && produced !== undefined && typeof produced.next === 'function') produced.next();
+        return () => {};
+      },
+      register(options, component) {
+        mounted.push({ options, component });
+        return () => {};
+      },
+    },
+    effect(fn) {
+      const disposer = fn();
+      return typeof disposer === 'function' ? disposer : () => {};
+    },
+    inject(_services, callback) {
+      // A nested fiber is handed a context derived from the caller's own, so
+      // the services stay visible to it — the proxy, not the bare object.
+      callback(proxied);
+    },
+  };
+  const proxied = new Proxy(ctx, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      if (prop in services) return services[prop];
+      throw new Error(`cannot get property "${String(prop)}" without inject`);
+    },
+  });
+  clientExports.apply(proxied);
+
+  const names = mounted.map((entry) => entry.options.name);
+  assert.ok(names.includes('settings.plugins.tab'), 'the settings tab must register');
+  assert.ok(names.includes('plugins.bundle.config'), "the plugin's own page must register");
+  assert.ok(names.includes('plugins.row.config'), "the plugin's own row must register");
+  const bundle = mounted.find((entry) => entry.options.name === 'plugins.bundle.config');
+  assert.equal(bundle.options.key, 'dsh-voice-v');
+  const row = mounted.find((entry) => entry.options.name === 'plugins.row.config');
+  assert.equal(row.options.key, 'dsh-voice-v#dsh-voice-v');
+  assert.ok(
+    mounted.some((entry) => entry.options.name === 'conversation.chat.assistant-actions'),
+    'the speaker button must keep registering',
+  );
+});
 
 await test('the card renders and shows every control it owns', async () => {
   const mini = createMiniReact();
@@ -2320,16 +2522,17 @@ await test('the card renders and shows every control it owns', async () => {
     assert.equal(pitchSlider().props.min, PITCH_RANGE.min);
     assert.equal(pitchSlider().props.max, PITCH_RANGE.max);
 
-    // The dictionary rows show the built-in readings the host reported.
+    // The dictionary lists the terms the user owns, not the built-in table:
+    // the shipped rows are the host's business, and the card shows only the
+    // ones whose reading differs from the shipped one.
     const redscript = elementsOf(mounted.tree).find(
       (node) => node.props !== undefined && node.props['aria-label'] === 'Транскрипция для redscript',
     );
-    assert.ok(redscript !== undefined, 'the built-in terms must be listed');
-    assert.equal(redscript.props.value, DEFAULT_PRONUNCIATION.redscript);
+    assert.equal(redscript, undefined, 'a built-in term the user never touched is not listed');
     const dictRows = elementsOf(mounted.tree).filter(
       (node) => node.props !== undefined && node.props.className === 'dvv-dict-row',
     );
-    assert.ok(dictRows.length > Object.keys(DEFAULT_PRONUNCIATION).length, 'every built-in term plus the add row');
+    assert.equal(dictRows.length, 1, 'only the add row is on screen while the user owns nothing');
 
     // Choosing a preset moves the sliders immediately, before any save.
     const ustaly = elementsOf(mounted.tree).find(
@@ -2413,11 +2616,12 @@ await test('the card shows the values the host resolved, not the raw form value'
   assert.equal(pitchSlider.props.value, 12, 'the tone slider must show the resolved tone');
   assert.ok(text.includes(settings.voice), 'the footer must name the resolved voice');
   assert.ok(text.includes('+6%') && text.includes('+12Hz'), 'the footer must show the resolved tempo and tone');
-  // The built-in dictionary lists a term named `undefined` itself, so the
-  // guard counts the word instead of looking for it: only the term may print it.
+  // The shipped dictionary holds a term named `undefined` itself, but the card
+  // no longer renders that table: nothing may print `undefined` at all — not a
+  // host value the form left out, and not a built-in row.
   assert.equal(
     (text.match(/undefined/g) ?? []).length,
-    1,
+    0,
     'the card must not print undefined for a value the host resolved',
   );
 });
@@ -2893,7 +3097,9 @@ await test('the card offers the voice catalogue the host reported, grouped', asy
   const mounted = await mountCard(component, { scope }, mini);
 
   // The voice is a select, not a free-text field.
-  const select = elementsOf(mounted.tree).find((node) => node.type === 'select');
+  const select = elementsOf(mounted.tree).find(
+    (node) => node.type === 'select' && node.props['aria-label'] === 'Голос edge-tts',
+  );
   assert.ok(select !== undefined, 'the card must offer the voice as a dropdown');
   assert.equal(select.props['aria-label'], 'Голос edge-tts');
   assert.equal(select.props.value, DEFAULT_VOICE, 'the select shows the voice in use');
@@ -2951,7 +3157,9 @@ await test('a stored voice outside the catalogue is still shown, not silently dr
 
   const mounted = await mountCard(component, { scope }, mini);
 
-  const select = elementsOf(mounted.tree).find((node) => node.type === 'select');
+  const select = elementsOf(mounted.tree).find(
+    (node) => node.type === 'select' && node.props['aria-label'] === 'Голос edge-tts',
+  );
   assert.ok(select !== undefined, 'the card must offer the voice as a dropdown');
   assert.equal(select.props.value, 'xx-XX-CustomNeural', 'the select must show the voice in use');
   const option = elementsOf(select).find(
@@ -2983,7 +3191,9 @@ await test('choosing a voice in the dropdown stages exactly one voice write', as
 
   const mounted = await mountCard(component, { scope }, mini);
 
-  const select = elementsOf(mounted.tree).find((node) => node.type === 'select');
+  const select = elementsOf(mounted.tree).find(
+    (node) => node.type === 'select' && node.props['aria-label'] === 'Голос edge-tts',
+  );
   select.props.onChange({ target: { value: 'ru-RU-DmitryNeural' } });
   await mounted.rerender();
 
@@ -2997,7 +3207,7 @@ await test('choosing a voice in the dropdown stages exactly one voice write', as
   assert.deepEqual(writes, [['set', 'voice', 'ru-RU-DmitryNeural']], 'one write, carrying the chosen id');
 });
 
-await test('the hand-written voice keeps the value and falls back to the default when cleared', async () => {
+await test('the hand-written voice keeps its own text, and an empty field writes nothing', async () => {
   const mini = createMiniReact();
   const settings = resolveVoiceConfig({});
   const stubFetch = async () => ({ ok: true, json: async () => configPayload(settings) });
@@ -3019,9 +3229,11 @@ await test('the hand-written voice keeps the value and falls back to the default
 
   const mounted = await mountCard(component, { scope }, mini);
 
-  // «Свой голос…» swaps the select for the text field, which opens on the
-  // voice in use: nothing is lost in the swap.
-  const select = elementsOf(mounted.tree).find((node) => node.type === 'select');
+  // «Свой голос…» swaps the select for the text field, which opens empty:
+  // the id is typed from scratch, and an empty field is not a voice yet.
+  const select = elementsOf(mounted.tree).find(
+    (node) => node.type === 'select' && node.props['aria-label'] === 'Голос edge-tts',
+  );
   const custom = elementsOf(select).find(
     (node) => node.type === 'option' && textOf(node).includes('Свой голос'),
   );
@@ -3033,7 +3245,14 @@ await test('the hand-written voice keeps the value and falls back to the default
     (node) => node.type === 'input' && node.props['aria-label'] === 'Голос edge-tts',
   );
   assert.ok(field !== undefined, 'the hand-written field must replace the dropdown');
-  assert.equal(field.props.value, DEFAULT_VOICE, 'the field opens on the voice in use');
+  assert.equal(field.props.value, '', 'the field opens empty: the id is typed from scratch');
+
+  // An empty field stages nothing: there is no voice to write yet.
+  const idle = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить',
+  );
+  assert.ok(idle !== undefined, 'the card must offer its Save');
+  assert.equal(idle.props.disabled, true, 'an untouched hand-written field stages nothing');
 
   // A typed voice is staged like the old free-text field wrote it.
   field.props.onChange({ target: { value: 'de-DE-KatjaNeural' } });
@@ -3041,28 +3260,35 @@ await test('the hand-written voice keeps the value and falls back to the default
   const save = elementsOf(mounted.tree).find(
     (node) => node.type === 'button' && textOf(node) === 'Сохранить' && node.props.disabled === false,
   );
+  assert.ok(save !== undefined, 'Save must become available once a voice is typed');
   await save.props.onClick();
   await mounted.rerender();
   assert.deepEqual(writes, [['set', 'voice', 'de-DE-KatjaNeural']], 'the typed id is what goes to edge-tts');
 
-  // An emptied field falls back to the default voice, never to nothing.
+  // The draft is rebuilt from the host once the write landed — and the text
+  // the user typed stays in the field, because it lives on its own state.
+  const kept = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'Голос edge-tts',
+  );
+  assert.ok(kept !== undefined, 'the hand-written field must stay on screen');
+  assert.equal(kept.props.value, 'de-DE-KatjaNeural', 'the field keeps the typed id across a rebuild');
+
+  // An emptied field means "not typed yet": it writes nothing at all, and it
+  // does not fall back to the default voice behind the user's back.
+  kept.props.onChange({ target: { value: '' } });
+  await mounted.rerender();
   const emptied = elementsOf(mounted.tree).find(
     (node) => node.type === 'input' && node.props['aria-label'] === 'Голос edge-tts',
   );
-  emptied.props.onChange({ target: { value: '' } });
-  await mounted.rerender();
-  const saveAgain = elementsOf(mounted.tree).find(
-    (node) => node.type === 'button' && textOf(node) === 'Сохранить' && node.props.disabled === false,
+  assert.equal(emptied.props.value, '', 'the emptied field shows nothing');
+  const idleAgain = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить',
   );
-  await saveAgain.props.onClick();
-  await mounted.rerender();
+  assert.equal(idleAgain.props.disabled, true, 'an emptied field stages nothing');
   assert.deepEqual(
     writes,
-    [
-      ['set', 'voice', 'de-DE-KatjaNeural'],
-      ['set', 'voice', DEFAULT_VOICE],
-    ],
-    'an emptied field falls back to the default voice',
+    [['set', 'voice', 'de-DE-KatjaNeural']],
+    'an emptied field writes nothing: no default voice behind the user’s back',
   );
 });
 
@@ -3094,19 +3320,35 @@ await test('the dictionary is collapsed and its summary reports the counts', asy
 
   const summary = elementsOf(details).find((node) => node.type === 'summary');
   assert.ok(summary !== undefined, 'the block must have a summary');
-  const text = textOf(summary);
+  // The rendered summary wraps: the text comes back in pieces, so the
+  // whitespace is put back before anything is looked for in it.
+  const text = textOf(summary).replace(/\s+/gu, ' ').trim();
   assert.ok(text.includes('Словарь произношения'), 'the summary names the block');
-  assert.ok(text.includes('150 терминов'), `the summary reports the term count; got: ${text}`);
-  assert.ok(text.includes('· 3 изменено'), `the summary reports the user's own entries; got: ${text}`);
+  // The count is the user's own terms, never the shipped table: three changed
+  // built-in readings are three rows on screen and three in the count.
+  assert.ok(text.includes('3 термина'), `the summary reports the user's own count; got: ${text}`);
+  assert.equal(text.includes('изменено'), false, 'the old two-number summary is gone');
 
-  // The editing UI is untouched inside the panel.
+  // Only the user's own terms are rows; the shipped table is not rendered.
+  const rows = elementsOf(details).filter(
+    (node) => node.props !== undefined && node.props.className === 'dvv-dict-row',
+  );
+  assert.equal(rows.length, 4, 'three owned terms plus the add row');
   const redscript = elementsOf(details).find(
     (node) => node.props !== undefined && node.props['aria-label'] === 'Транскрипция для redscript',
   );
-  assert.ok(redscript !== undefined, 'the built-in terms are still editable');
+  assert.ok(redscript !== undefined, 'a term the user re-read is listed');
   assert.equal(redscript.props.value, 'ред скрипт', 'the user reading is the one on screen');
+  const untouched = elementsOf(details).find(
+    (node) => node.props !== undefined && node.props['aria-label'] === 'Транскрипция для HUD',
+  );
+  assert.equal(untouched, undefined, 'a shipped term the user never changed is not listed');
   const add = elementsOf(details).find((node) => node.props !== undefined && node.props['aria-label'] === 'Новый термин');
   assert.ok(add !== undefined, 'a new term can still be added');
+  const addButton = elementsOf(details).find(
+    (node) => node.type === 'button' && textOf(node) === 'Добавить',
+  );
+  assert.ok(addButton !== undefined, 'the add button is inside the block, next to the fields');
 
   // The dictionary is the last thing on the card.
   const card = elementsOf(mounted.tree).find(
@@ -3115,7 +3357,7 @@ await test('the dictionary is collapsed and its summary reports the counts', asy
   const children = card.props.children;
   assert.equal(children[children.length - 1].type, 'details', 'the card ends with the dictionary');
 
-  // A user who changed nothing owns nothing: the marker is not shown.
+  // A user who changed nothing owns nothing: no rows, and the block says so.
   const clean = await mountCard(
     component,
     {
@@ -3135,9 +3377,81 @@ await test('the dictionary is collapsed and its summary reports the counts', asy
     mini.instance(),
   );
   const cleanDetails = elementsOf(clean.tree).find((node) => node.type === 'details');
-  const cleanSummary = textOf(elementsOf(cleanDetails).find((node) => node.type === 'summary'));
-  assert.ok(cleanSummary.includes('150 терминов'), `the summary reports the term count; got: ${cleanSummary}`);
-  assert.equal(cleanSummary.includes('изменено'), false, 'a user who changed nothing owns no entries');
+  const cleanSummary = textOf(elementsOf(cleanDetails).find((node) => node.type === 'summary')).replace(/\s+/gu, ' ').trim();
+  assert.ok(
+    cleanSummary.includes('0 терминов'),
+    `a user who owns nothing reports zero; got: ${cleanSummary}`,
+  );
+  const cleanText = textOf(cleanDetails).replace(/\s+/gu, ' ').trim();
+  assert.ok(cleanText.includes('Своих терминов пока нет'), 'the empty block says what it means');
+});
+
+await test('adding a term writes it right away, without the card’s Save', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({ ok: true, json: async () => configPayload(settings) });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+  const writes = [];
+
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings },
+      base: {},
+      user: {},
+      revision: 21,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+
+  const termField = () => elementsOf(mounted.tree).find(
+    (node) => node.props !== undefined && node.props['aria-label'] === 'Новый термин',
+  );
+  const spokenField = () => elementsOf(mounted.tree).find(
+    (node) => node.props !== undefined && node.props['aria-label'] === 'Транскрипция нового термина',
+  );
+  const addButton = () => elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Добавить',
+  );
+
+  // The button is dead until both fields carry something.
+  assert.equal(addButton().props.disabled, true, 'an empty pair cannot be added');
+
+  // A term the shipped table does not carry: `Anima` would match the built-in
+  // `ANIMA` entry, and re-adding it with the shipped reading writes nothing.
+  termField().props.onChange({ target: { value: 'Zerotul' } });
+  await mounted.rerender();
+  assert.equal(addButton().props.disabled, true, 'a term without a reading is not enough');
+
+  spokenField().props.onChange({ target: { value: 'анима' } });
+  await mounted.rerender();
+  assert.equal(addButton().props.disabled, false, 'a full pair arms the button');
+
+  await addButton().props.onClick();
+  await mounted.rerender();
+
+  // The rows cross a vm realm, so the map's own prototype is not the one this
+  // file was loaded in: the write is compared as the plain data it is.
+  assert.equal(
+    JSON.stringify(writes),
+    JSON.stringify([['set', 'dictionary', { Zerotul: 'анима' }]]),
+    'the add writes the dictionary itself, and nothing else',
+  );
+  const text = textOf(mounted.tree).replace(/\s+/gu, ' ').trim();
+  assert.ok(text.includes('1 термин'), 'the new term shows up in the count right away');
+  assert.equal(
+    elementsOf(mounted.tree).some(
+      (node) => node.type === 'button' && textOf(node) === 'Сохранить' && node.props.disabled === false,
+    ),
+    false,
+    'the card’s own Save is not armed by a dictionary write',
+  );
+  assert.equal(termField().props.value, '', 'the term field is cleared');
+  assert.equal(spokenField().props.value, '', 'the reading field is cleared');
 });
 
 await test('the card still exposes every setting it owned before', async () => {
@@ -3156,6 +3470,11 @@ await test('the card still exposes every setting it owned before', async () => {
     'customBaseUrl',
     'customApiKey',
     'customModel',
+    'yandexApiKey',
+    'yandexVoice',
+    'googleApiKey',
+    'googleVoice',
+    'yoMode',
   ]);
 
   const mini = createMiniReact();
@@ -3252,7 +3571,7 @@ await test('the card offers the variants the host reported and stages one write 
   const options = elementsOf(select).filter((node) => node.type === 'option');
   assert.deepEqual(
     options.map((option) => option.props.value),
-    ['off', 'bars', 'wave', 'pulse', 'dots'],
+    ['off', 'bars', 'wave', 'oscillo', 'pulse', 'dots'],
   );
   assert.ok(textOf(options[1]).includes('Спектр'), 'the variants are named the way a user knows them');
   assert.equal(select.props.value, 'bars', 'the dropdown shows the variant in use');
@@ -3302,7 +3621,7 @@ await test('the card offers the synthesis provider and hides the endpoint fields
   assert.ok(text.includes('Синтез речи'), 'the card must have a group of its own for the provider');
   assert.ok(text.includes('edge-tts остаётся дефолтом'), 'the card explains that edge-tts is the default');
 
-  // The provider is a dropdown of the two providers.
+  // The provider is a dropdown of the four providers.
   const select = elementsOf(mounted.tree).find(
     (node) => node.type === 'select' && node.props['aria-label'] === 'Провайдер синтеза',
   );
@@ -3310,14 +3629,23 @@ await test('the card offers the synthesis provider and hides the endpoint fields
   const options = elementsOf(select).filter((node) => node.type === 'option');
   assert.deepEqual(
     options.map((option) => option.props.value),
-    ['edge', 'custom'],
+    ['edge', 'custom', 'yandex', 'google', 'google-free'],
   );
   assert.ok(textOf(options[0]).includes('edge-tts'));
   assert.ok(textOf(options[1]).includes('OpenAI'));
+  assert.ok(textOf(options[2]).includes('Яндекс'));
+  assert.ok(textOf(options[3]).includes('Google'));
+  assert.ok(textOf(options[4]).includes('без ключа'));
   assert.equal(select.props.value, 'edge', 'the dropdown shows the provider in use');
 
   // The endpoint's own fields belong to the endpoint only.
-  for (const label of ['Base URL эндпоинта', 'Model ID эндпоинта', 'API Key эндпоинта']) {
+  for (const label of [
+    'Base URL эндпоинта',
+    'Model ID эндпоинта',
+    'API Key эндпоинта',
+    'Голос Яндекса',
+    'Ключ API Яндекс SpeechKit',
+  ]) {
     assert.equal(
       elementsOf(mounted.tree).some((node) => node.type === 'input' && node.props['aria-label'] === label),
       false,
@@ -3399,6 +3727,67 @@ await test('choosing the custom provider shows the endpoint and stages one write
       ['set', 'customApiKey', 'sk-typed-by-the-user'],
     ],
     'one write per field, and the key is written because something was typed',
+  );
+});
+
+await test('every provider the card offers can actually be chosen', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({
+    ok: true,
+    json: async () => configPayload(settings, { ttsProvider: 'edge', customApiKeySet: false }),
+  });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+
+  const writes = [];
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings },
+      base: {},
+      user: {},
+      revision: 22,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+  const selectOf = () =>
+    elementsOf(mounted.tree).find(
+      (node) => node.type === 'select' && node.props['aria-label'] === 'Провайдер синтеза',
+    );
+
+  const ids = elementsOf(selectOf())
+    .filter((node) => node.type === 'option')
+    .map((option) => option.props.value);
+  assert.deepEqual(ids, ['edge', 'custom', 'yandex', 'google', 'google-free']);
+
+  // Every offered provider must stay chosen. The card once kept only `custom`
+  // and `yandex` and snapped every other choice back to `edge` — the option was
+  // on screen and could not be taken.
+  for (const id of ids) {
+    selectOf().props.onChange({ target: { value: id } });
+    await mounted.rerender();
+    assert.equal(
+      selectOf().props.value,
+      id,
+      `choosing ${id} must keep ${id} chosen, not fall back to edge`,
+    );
+  }
+
+  const save = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить' && node.props.disabled === false,
+  );
+  assert.ok(save !== undefined, 'Save must be available once a provider is chosen');
+  await save.props.onClick();
+  await mounted.rerender();
+
+  assert.deepEqual(
+    writes,
+    [['set', 'ttsProvider', 'google-free']],
+    'the last choice is the one that gets written',
   );
 });
 
@@ -3486,6 +3875,117 @@ await test('a card that never typed a key writes no key at all', async () => {
   );
   assert.equal(save.props.disabled, true, 'Save stays disabled while nothing is staged');
   assert.deepEqual(writes, []);
+});
+
+await test('the custom endpoint key is written right now, without the card’s Save', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({
+    ok: true,
+    json: async () => configPayload(settings, { ttsProvider: 'custom', customApiKeySet: false }),
+  });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+
+  const writes = [];
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings, ttsProvider: 'custom' },
+      base: {},
+      user: {},
+      revision: 24,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+
+  // The own control sits next to the reset one, and it waits for a key.
+  const saveKey = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить ключ',
+  );
+  assert.ok(saveKey !== undefined, 'the card must offer a way to write the key at once');
+  assert.equal(saveKey.props.disabled, true, 'the control waits until something is typed');
+
+  const key = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'API Key эндпоинта',
+  );
+  assert.ok(key !== undefined, 'the key field must be on screen for the custom provider');
+  key.props.onChange({ target: { value: 'sk-typed-by-the-user' } });
+  await mounted.rerender();
+
+  const armed = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить ключ',
+  );
+  assert.equal(armed.props.disabled, false, 'a typed key arms the control');
+
+  // The write goes to the host on the spot: the card’s own Save is not pressed.
+  await armed.props.onClick();
+  await mounted.rerender();
+
+  assert.deepEqual(writes, [['set', 'customApiKey', 'sk-typed-by-the-user']], 'the key reached the host at once');
+  assert.ok(textOf(mounted.tree).includes('Ключ сохранён.'), 'the card says the key is stored');
+
+  // The field goes blank, and the staged copy of the same key is gone: the
+  // card’s Save has nothing left to write.
+  const cleared = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'API Key эндпоинта',
+  );
+  assert.equal(cleared.props.value, '', 'the field goes blank once the host took the key');
+  const save = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить',
+  );
+  assert.equal(save.props.disabled, true, 'the staged copy of the key is gone');
+});
+
+await test('the Yandex key is written right now, without the card’s Save', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({});
+  const stubFetch = async () => ({
+    ok: true,
+    json: async () => configPayload(settings, { ttsProvider: 'yandex', yandexApiKeySet: false }),
+  });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+
+  const writes = [];
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings, ttsProvider: 'yandex' },
+      base: {},
+      user: {},
+      revision: 25,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+
+  const key = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'Ключ API Яндекс SpeechKit',
+  );
+  assert.ok(key !== undefined, 'the Yandex key field must be on screen for the Yandex provider');
+  key.props.onChange({ target: { value: 'yandex-key-typed-by-the-user' } });
+  await mounted.rerender();
+
+  const saveKey = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить ключ',
+  );
+  assert.ok(saveKey !== undefined, 'the Yandex panel must offer a way to write the key at once');
+  assert.equal(saveKey.props.disabled, false, 'a typed key arms the control');
+
+  await saveKey.props.onClick();
+  await mounted.rerender();
+
+  assert.deepEqual(writes, [['set', 'yandexApiKey', 'yandex-key-typed-by-the-user']], 'the key reached the host at once');
+  const cleared = elementsOf(mounted.tree).find(
+    (node) => node.type === 'input' && node.props['aria-label'] === 'Ключ API Яндекс SpeechKit',
+  );
+  assert.equal(cleared.props.value, '', 'the field goes blank once the host took the key');
 });
 
 // ---------------------------------------------------------------------------
@@ -3979,6 +4479,17 @@ function visualizationOf(tree) {
   );
 }
 
+/**
+ * The composer's wide trace inside a rendered tree.
+ * @param tree - The rendered tree.
+ * @returns The element, or undefined.
+ */
+function oscilloStripOf(tree) {
+  return elementsOf(tree).find(
+    (node) => node.props !== undefined && node.props.className === 'dvv-osc',
+  );
+}
+
 await test('with the visualization off, a playing message shows no visualization', async () => {
   const mini = createMiniReact();
   const { fetchStub } = makeHostFetch([{ url: '/dsh-voice-v/audio/part-1.mp3' }], { spectrum: 'off' });
@@ -4058,7 +4569,9 @@ await test('a voice taken away by another message switches its visualization off
 
 await test('the analysed variant routes the playing element through the analyser and draws', async () => {
   const mini = createMiniReact();
-  const { fetchStub } = makeHostFetch([{ url: '/dsh-voice-v/audio/part-1.mp3' }], { spectrum: 'bars' });
+  // `wave` is the analysed variant that still draws inside the button: the
+  // spectrum and the wide trace moved to the strip over the composer.
+  const { fetchStub } = makeHostFetch([{ url: '/dsh-voice-v/audio/part-1.mp3' }], { spectrum: 'wave' });
   const { context, ledger } = createFakeAudioContext();
   const { document: fakeDocument, ledger: documentLedger } = createFakeDocument();
   const frames = createFakeFrames();
@@ -4103,7 +4616,7 @@ await test('the analysed variant routes the playing element through the analyser
   const buttonNode = elementsOf(only.mounted.tree).find((node) => node.type === 'button');
   const visualization = visualizationOf(only.mounted.tree);
   assert.ok(visualization !== undefined, 'the button must show the visualization');
-  assert.equal(visualization.props['data-variant'], 'bars');
+  assert.equal(visualization.props['data-variant'], 'wave');
   assert.ok(elementsOf(buttonNode).includes(visualization), 'the visualization must be inside the button');
 });
 
@@ -4190,7 +4703,9 @@ await test('a context that cannot be created leaves the element alone and the vo
 
 await test('a browser that demands an anonymous cross-origin mode still gets the sound', async () => {
   const mini = createMiniReact();
-  const { fetchStub } = makeHostFetch([{ url: '/dsh-voice-v/audio/part-1.mp3' }], { spectrum: 'bars' });
+  // The analysed variant that draws in the button; the composer variants are
+  // covered by their own test.
+  const { fetchStub } = makeHostFetch([{ url: '/dsh-voice-v/audio/part-1.mp3' }], { spectrum: 'wave' });
   const { context, ledger } = createFakeAudioContext({ strictCrossOrigin: true });
   const { document: fakeDocument, ledger: documentLedger } = createFakeDocument();
   const { button, audio } = loadClientComponents(
@@ -4220,6 +4735,101 @@ await test('a browser that demands an anonymous cross-origin mode still gets the
   assert.equal(ledger.elements.length, 1, 'the element must end up in the graph');
   assert.equal(elements[0].crossOrigin, 'anonymous', 'the element must be made anonymous for the retry');
   assert.ok(documentLedger.draws > 0, 'the visualization must draw');
+});
+
+await test('the oscillo variant draws a live trace over the composer and it goes with the voice', async () => {
+  const mini = createMiniReact();
+  const { fetchStub } = makeHostFetch([{ url: '/dsh-voice-v/audio/part-1.mp3' }], { spectrum: 'oscillo' });
+  const { context } = createFakeAudioContext();
+  const { document: fakeDocument, ledger: documentLedger } = createFakeDocument();
+  const { button, oscillo, audio } = loadClientComponents(mini.react, {
+    ...browserGlobals(fetchStub),
+    AudioContext: function AudioContextStub() {
+      return context;
+    },
+    document: fakeDocument,
+  });
+  const elements = [];
+  audio.setCreateElement((url) => {
+    const element = createFakeAudio(url);
+    elements.push(element);
+    return element;
+  });
+
+  // The composer's strip is a component of its own: it is mounted where the
+  // shell's dock slot would put it, and its own hook store is not the button's.
+  const strip = await mountComponent(oscillo, { sessionId: 'session-1' }, mini.instance());
+  assert.equal(oscilloStripOf(strip.tree), undefined, 'an idle composer shows no trace at all');
+
+  const only = await mountVoiceButton(button, 'm1', mini);
+  await only.click();
+  assert.equal(only.phase(), 'playing', 'the voice must start');
+  assert.equal(elements[0].playing, true, 'the sound must play');
+
+  // One voice, one trace: the slot hands the same analyser to the composer.
+  await strip.rerender();
+  const drawn = oscilloStripOf(strip.tree);
+  assert.ok(drawn !== undefined, 'the composer must show the trace while the voice plays');
+  assert.equal(drawn.props['data-variant'], 'oscillo');
+  assert.ok(documentLedger.canvases.length > 0, 'the trace must own a canvas');
+  assert.ok(documentLedger.draws > 0, 'the trace must draw');
+  assert.equal(
+    visualizationOf(only.mounted.tree),
+    undefined,
+    'the wide trace does not squeeze itself into the message button',
+  );
+
+  // The voice stops: the strip goes with it.
+  await only.click();
+  assert.equal(only.phase(), 'idle');
+  await strip.rerender();
+  assert.equal(oscilloStripOf(strip.tree), undefined, 'the trace must go when the voice stops');
+});
+
+await test('the spectrum variant draws the wide bars over the composer, not in the button', async () => {
+  const mini = createMiniReact();
+  const { fetchStub } = makeHostFetch([{ url: '/dsh-voice-v/audio/part-1.mp3' }], { spectrum: 'bars' });
+  const { context } = createFakeAudioContext();
+  const { document: fakeDocument, ledger: documentLedger } = createFakeDocument();
+  const { button, oscillo, audio } = loadClientComponents(mini.react, {
+    ...browserGlobals(fetchStub),
+    AudioContext: function AudioContextStub() {
+      return context;
+    },
+    document: fakeDocument,
+  });
+  const elements = [];
+  audio.setCreateElement((url) => {
+    const element = createFakeAudio(url);
+    elements.push(element);
+    return element;
+  });
+
+  const strip = await mountComponent(oscillo, { sessionId: 'session-1' }, mini.instance());
+  assert.equal(oscilloStripOf(strip.tree), undefined, 'an idle composer shows no strip at all');
+
+  const only = await mountVoiceButton(button, 'm1', mini);
+  await only.click();
+  assert.equal(only.phase(), 'playing', 'the voice must start');
+  assert.equal(elements[0].playing, true, 'the sound must play');
+
+  // The same analyser feeds the wide bars, and the strip names its variant.
+  await strip.rerender();
+  const drawn = oscilloStripOf(strip.tree);
+  assert.ok(drawn !== undefined, 'the composer must show the spectrum while the voice plays');
+  assert.equal(drawn.props['data-variant'], 'bars');
+  assert.ok(documentLedger.canvases.length > 0, 'the spectrum must own a canvas');
+  assert.ok(documentLedger.draws > 0, 'the spectrum must draw');
+  assert.equal(
+    visualizationOf(only.mounted.tree),
+    undefined,
+    'the wide spectrum does not squeeze itself into the message button',
+  );
+
+  await only.click();
+  assert.equal(only.phase(), 'idle');
+  await strip.rerender();
+  assert.equal(oscilloStripOf(strip.tree), undefined, 'the spectrum must go when the voice stops');
 });
 
 console.log('');

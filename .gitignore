@@ -8,3 +8,6 @@ node_modules/
 *.zip
 
 *.log
+
+# Local one-off provider probes: research scripts, not part of the plugin.
+tools/

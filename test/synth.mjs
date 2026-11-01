@@ -32,8 +32,18 @@ import { zstdDecompressSync } from 'node:zlib';
 
 import { DEFAULT_EDGE_TTS_BIN, DEFAULT_PRESETS, DEFAULT_VOICE, normalizePitch, normalizeRate, resolveVoiceConfig } from '../lib/config.js';
 import { createVoiceHandler } from '../lib/index.js';
-import { cacheKeyFor, createSynthService } from '../lib/synth.js';
-import { cleanForSpeech, prepareForSpeech, splitIntoChunks } from '../lib/text.js';
+import {
+  cacheKeyFor,
+  createSynthService,
+  googleAudioBytes,
+  googleFreePieces,
+  googleFreeUrl,
+  googlePitchSemitones,
+  googleVolumeDb,
+  yandexAudioBytes,
+  yandexSpeechRequest,
+} from '../lib/synth.js';
+import { applyYoMode, cleanForSpeech, prepareForSpeech, spellYo, splitIntoChunks } from '../lib/text.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -147,7 +157,50 @@ await test('keeps Russian prose intact', () => {
   const cleaned = cleanForSpeech(source);
   assert.match(cleaned, /Готово\./);
   assert.match(cleaned, /обновил конфигурацию/);
+  // The letter ё stays as it is written: the Russian voices read it, and the
+  // user heard it and called it perfect.
   assert.match(cleaned, /всё работает\./);
+  // The written-out spelling is still there, for a voice that needs it.
+  const spelled = cleanForSpeech(source, { yoMode: 'spelled' });
+  assert.match(spelled, /всьо работает\./);
+});
+
+await test('the letter ё is written out the way a Russian reader reads it', () => {
+  // In the middle of a word, after a soft consonant: "йо".
+  assert.equal(spellYo('приём'), 'прийом');
+  assert.equal(spellYo('моё'), 'мойо');
+  // At the beginning of a word, or after a hard consonant: "ьо".
+  assert.equal(spellYo('всё'), 'всьо');
+  assert.equal(spellYo('нёбо'), 'ньобо');
+  assert.equal(spellYo('ушёл'), 'ушьол');
+  // The hard sign is dropped, the way a reader drops it.
+  assert.equal(spellYo('съёмка'), 'сьомка');
+  // A "й" before the letter is not doubled.
+  assert.equal(spellYo('мойё'), 'мойо');
+  // A hard consonant takes the "ьо" spelling.
+  assert.equal(spellYo('счёт'), 'счьот');
+  // The rest of the text is untouched.
+  assert.equal(spellYo('привет, всё'), 'привет, всьо');
+});
+
+await test('the way the letter ё is handled is the user\'s choice', () => {
+  // As written: the letter stays, and the Edge voice reads it as "йе".
+  assert.equal(applyYoMode('приём всё', 'as-is'), 'приём всё');
+  // Without the dots: the word loses the letter, not the sound.
+  assert.equal(applyYoMode('приём всё', 'plain'), 'прием все');
+  // Written out: the phonetics, spelled.
+  assert.equal(applyYoMode('приём всё', 'spelled'), 'прийом всьо');
+  // An unknown mode changes nothing.
+  assert.equal(applyYoMode('приём', 'nonsense'), 'приём');
+});
+
+await test('the mode reaches the text the voice reads', () => {
+  const asIs = cleanForSpeech('Приём и всё.', { yoMode: 'as-is' });
+  assert.match(asIs, /Приём и всё\./);
+  const plain = cleanForSpeech('Приём и всё.', { yoMode: 'plain' });
+  assert.match(plain, /Прием и все\./);
+  const spelled = cleanForSpeech('Приём и всё.', { yoMode: 'spelled' });
+  assert.match(spelled, /Прийом и всьо\./);
 });
 
 await test('replaces a fenced code block with «блок кода»', () => {
@@ -239,6 +292,67 @@ await test('prepareForSpeech reports truncation', () => {
   const prepared = prepareForSpeech('а'.repeat(500), { maxTextChars: 100, maxChunkChars: 60 });
   assert.equal(prepared.truncated, true);
   assert.equal(prepared.cleaned.length, 100);
+});
+
+console.log('\ncode identifiers and dots');
+
+await test('a member-access dot does not end a chunk', () => {
+  const text = 'Он вызвал ctx.inject, потом ctx.get() и закрыл.';
+  const chunks = splitIntoChunks(text, 320);
+  assert.equal(chunks.length, 1, `expected one chunk, got ${JSON.stringify(chunks)}`);
+  assert.match(chunks[0], /ctx\.inject/);
+  assert.match(chunks[0], /ctx\.get\(\)/);
+});
+
+await test('a path with a dot in it stays in one chunk', () => {
+  const chunks = splitIntoChunks('Открыл lib/client.js и проверил сборку.', 320);
+  assert.equal(chunks.length, 1, `expected one chunk, got ${JSON.stringify(chunks)}`);
+});
+
+await test('a decimal number keeps its point and stays in one chunk', () => {
+  const chunks = splitIntoChunks('Цена 3.14 и вес 0.5.', 320);
+  assert.equal(chunks.length, 1, `expected one chunk, got ${JSON.stringify(chunks)}`);
+  const prepared = prepareForSpeech('Цена 3.14 и вес 0.5.');
+  assert.match(prepared.cleaned, /3\.14/);
+  assert.match(prepared.cleaned, /0\.5/);
+});
+
+await test('a member-access dot is read as a space', () => {
+  const prepared = prepareForSpeech('Вызов ctx.inject и ctx.get() прошёл.');
+  assert.match(prepared.cleaned, /ctx inject/);
+  assert.match(prepared.cleaned, /ctx get\(\)/);
+  assert.doesNotMatch(prepared.cleaned, /ctx\./);
+  assert.equal(prepared.chunks.length, 1);
+});
+
+await test('a nested identifier is read as separate words', () => {
+  const prepared = prepareForSpeech('Путь foo.bar.baz проверен.');
+  assert.match(prepared.cleaned, /foo bar baz/);
+  assert.doesNotMatch(prepared.cleaned, /foo\./);
+});
+
+await test('ordinary prose keeps its sentence dots and its chunk boundary', () => {
+  const prepared = prepareForSpeech('Привет. Как дела?', { maxChunkChars: 10 });
+  assert.equal(prepared.chunks.length, 2);
+  assert.equal(prepared.chunks[0], 'Привет.');
+  assert.equal(prepared.chunks[1], 'Как дела?');
+  assert.match(prepared.cleaned, /Привет\. Как дела\?/);
+});
+
+await test('the letter ё modes are untouched by the dot rule', () => {
+  const asIs = prepareForSpeech('Всё в ctx.inject.', { yoMode: 'as-is' });
+  assert.match(asIs.cleaned, /Всё в ctx inject\./);
+  const plain = prepareForSpeech('Всё в ctx.inject.', { yoMode: 'plain' });
+  assert.match(plain.cleaned, /Все в ctx inject\./);
+  const spelled = prepareForSpeech('Всё в ctx.inject.', { yoMode: 'spelled' });
+  assert.match(spelled.cleaned, /Всьо в ctx inject\./);
+});
+
+await test('the code and the table are read the way they are written', () => {
+  const source = ['```js', 'console.log(a);', '```', '| Файл |', '| --- |', '| a.js |'].join('\n');
+  const cleaned = cleanForSpeech(source, { stripCode: false });
+  assert.match(cleaned, /console\.log/);
+  assert.match(cleaned, /a\.js/);
 });
 
 console.log('\nvoice configuration');
@@ -1005,6 +1119,522 @@ if (realSessionFile !== undefined && realSessionFile !== '' && existsSync(realSe
     '\n(optional) set DSH_VOICE_V_SESSION_FILE=<session.v4.jsonl.zstd> to replay the lookup against a real transcript',
   );
 }
+
+// ---------------------------------------------------------------------------
+// The Yandex provider
+// ---------------------------------------------------------------------------
+console.log('\nYandex provider');
+
+const YANDEX_KEY = 'yandex-secret-key';
+
+await test('the Yandex request carries the voice, the text and the key', () => {
+  const request = yandexSpeechRequest({
+    voice: 'ermil',
+    text: 'Проверка Яндекса.',
+    rate: '+6%',
+    apiKey: YANDEX_KEY,
+  });
+  assert.ok(request.url.startsWith('https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis?'), request.url);
+  assert.ok(request.url.includes('voice=ermil'), 'the voice travels in the query');
+  assert.ok(request.url.includes('format=mp3'), 'the format travels in the query');
+  assert.ok(request.url.includes('speed=1.06'), 'the tempo becomes a multiplier');
+  assert.equal(request.headers.Authorization, `Api-Key ${YANDEX_KEY}`);
+  assert.equal(request.headers['X-DataLoggin-Enabled'], 'false');
+  // The v3 body: the text, the hints as an ARRAY and the wanted container.
+  assert.deepEqual(request.body, {
+    text: 'Проверка Яндекса.',
+    hints: [{ voice: 'ermil', speed: 1.06 }],
+    outputAudioSpec: { containerAudio: { containerAudioType: 'MP3' } },
+  });
+});
+
+await test('the Yandex request without a tempo sends no speed at all', () => {
+  const request = yandexSpeechRequest({ voice: 'marina', text: 'Тихо.', rate: '', apiKey: YANDEX_KEY });
+  assert.ok(!request.url.includes('speed='), 'an unset tempo is not sent');
+});
+
+await test('an unknown Yandex voice falls back to the one that always exists', () => {
+  const request = yandexSpeechRequest({ voice: 'nope', text: 'Тихо.', rate: '', apiKey: YANDEX_KEY });
+  assert.ok(request.url.includes('voice=marina'), request.url);
+});
+
+await test('the audio is taken out of the Yandex envelope', () => {
+  const audio = Buffer.from('yandex-audio');
+  const bytes = yandexAudioBytes(JSON.stringify({ result: { audioChunk: { data: audio.toString('base64') } } }));
+  assert.deepEqual(bytes, audio);
+});
+
+await test('a Yandex answer without audio is an error, not an empty file', () => {
+  assert.throws(() => yandexAudioBytes('{"result":{}}'), /without audio/);
+  assert.throws(() => yandexAudioBytes('not json at all'), /not JSON/);
+});
+
+await test('the Yandex provider synthesizes and caches the same way', async () => {
+  const audio = Buffer.from('ID3yandex-audio'.padEnd(2048, '.'));
+  const fetchImpl = recordingFetch(async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ result: { audioChunk: { data: audio.toString('base64') } } }),
+  }));
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+6%',
+      pitch: '+12Hz',
+      volume: '+0%',
+      ttsProvider: 'yandex',
+      yandexApiKey: YANDEX_KEY,
+      yandexVoice: 'marina',
+    }),
+  });
+
+  const result = await service.ensure('Проверка Яндекса.');
+  assert.equal(fetchImpl.calls.length, 1, 'the service must be asked exactly once');
+  assert.ok(existsSync(result.file), `missing cache file ${result.file}`);
+  assert.deepEqual(await readFile(result.file), audio);
+
+  const again = await service.ensure('Проверка Яндекса.');
+  assert.equal(again.cached, true, 'the second call must be a cache hit');
+  assert.equal(fetchImpl.calls.length, 1, 'a cache hit must not ask the service again');
+});
+
+await test('the Yandex provider without a key stays on the local CLI', async () => {
+  const fetchImpl = recordingFetch(async () => {
+    throw new Error('the service must not be asked');
+  });
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+0%',
+      pitch: '+0Hz',
+      volume: '+0%',
+      ttsProvider: 'yandex',
+      yandexApiKey: '',
+      yandexVoice: 'marina',
+    }),
+  });
+  const result = await service.ensure('Проверка локального пути.');
+  assert.equal(fetchImpl.calls.length, 0, 'the service must not be asked without a key');
+  assert.ok(existsSync(result.file), 'the local CLI must have written the file');
+});
+
+// ---------------------------------------------------------------------------
+// The Yandex provider, the v3 route of the service
+// ---------------------------------------------------------------------------
+console.log('\nYandex provider (the v3 route of the service)');
+
+const YANDEX_CHUNK_ONE = Buffer.from('chunk-one');
+const YANDEX_CHUNK_TWO = Buffer.from('chunk-two');
+const YANDEX_ONE_B64 = YANDEX_CHUNK_ONE.toString('base64');
+const YANDEX_TWO_B64 = YANDEX_CHUNK_TWO.toString('base64');
+
+/** The query of a request, read the way a server would read it. */
+function queryOf(request) {
+  return new URL(request.url).searchParams;
+}
+
+await test('the request speaks the utteranceSynthesis route of the service', () => {
+  const request = yandexSpeechRequest({
+    voice: 'ermil',
+    text: 'Проверка Яндекса.',
+    rate: '+6%',
+    apiKey: YANDEX_KEY,
+  });
+  assert.ok(
+    request.url.startsWith('https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis?'),
+    request.url,
+  );
+  assert.ok(!request.url.includes('/tts/v3/voiceSynthesis'), 'the old v2 route must be gone');
+  assert.equal(request.body.text, 'Проверка Яндекса.');
+  assert.ok(Array.isArray(request.body.hints), 'the service rejects a hints object: it must be an array');
+  assert.equal(request.body.hints.length, 1);
+  assert.equal(request.body.hints[0].voice, 'ermil');
+  assert.equal(request.body.outputAudioSpec.containerAudio.containerAudioType, 'MP3');
+  assert.equal(request.headers.Authorization, `Api-Key ${YANDEX_KEY}`);
+  assert.equal(request.headers['Content-Type'], 'application/json');
+  assert.equal(request.headers['X-DataLoggin-Enabled'], 'false');
+});
+
+await test('the tempo becomes a plain multiplier in the hints', () => {
+  const cases = [
+    ['+6%', 1.06],
+    ['1.0', 1],
+    ['-5%', 0.95],
+  ];
+  for (const [rate, speed] of cases) {
+    const request = yandexSpeechRequest({ voice: 'marina', text: 'Тихо.', rate, apiKey: YANDEX_KEY });
+    assert.equal(request.body.hints[0].speed, speed, `the speed of ${rate}`);
+    assert.equal(queryOf(request).get('speed'), String(speed), `the query speed of ${rate}`);
+  }
+});
+
+await test('the hint carries no speed when no tempo is configured', () => {
+  const request = yandexSpeechRequest({ voice: 'marina', text: 'Тихо.', rate: '', apiKey: YANDEX_KEY });
+  assert.deepEqual(request.body.hints[0], { voice: 'marina' });
+  assert.equal(queryOf(request).get('speed'), null);
+});
+
+await test('the request keeps the query the older gateway understood', () => {
+  const request = yandexSpeechRequest({ voice: 'pavel', text: 'Тихо.', rate: '+6%', apiKey: YANDEX_KEY });
+  const query = queryOf(request);
+  assert.equal(query.get('voice'), 'pavel');
+  assert.equal(query.get('format'), 'mp3');
+  assert.equal(query.get('sampleRate'), '48000');
+  assert.equal(query.get('speed'), '1.06');
+});
+
+await test('the tone becomes a shift in hertz in the hints', () => {
+  const cases = [
+    ['+12Hz', 12],
+    ['-8Hz', -8],
+    ['0', 0],
+  ];
+  for (const [pitch, shift] of cases) {
+    const request = yandexSpeechRequest({ voice: 'marina', text: 'Тихо.', pitch, apiKey: YANDEX_KEY });
+    assert.equal(request.body.hints[0].pitchShift, shift, `the shift of ${pitch}`);
+  }
+});
+
+await test('the tone leaves the hint alone when none is configured', () => {
+  const request = yandexSpeechRequest({ voice: 'marina', text: 'Тихо.', pitch: '', apiKey: YANDEX_KEY });
+  assert.equal(request.body.hints[0].pitchShift, undefined);
+});
+
+await test('the volume becomes a multiplier in the hints', () => {
+  const cases = [
+    ['+10%', 1.1],
+    ['-20%', 0.8],
+    ['+0%', 1],
+  ];
+  for (const [volume, multiplier] of cases) {
+    const request = yandexSpeechRequest({ voice: 'marina', text: 'Тихо.', volume, apiKey: YANDEX_KEY });
+    assert.equal(request.body.hints[0].volume, multiplier, `the volume of ${volume}`);
+  }
+});
+
+await test('the tone and the volume are clamped into the service domain', () => {
+  const request = yandexSpeechRequest({
+    voice: 'marina',
+    text: 'Тихо.',
+    pitch: '+900Hz',
+    volume: '+900%',
+    apiKey: YANDEX_KEY,
+  });
+  assert.equal(request.body.hints[0].pitchShift, 40);
+  assert.equal(request.body.hints[0].volume, 4);
+});
+
+await test('the folder of the key travels in the query, never in the body', () => {
+  const request = yandexSpeechRequest({
+    voice: 'marina',
+    text: 'Тихо.',
+    rate: '',
+    apiKey: YANDEX_KEY,
+    folderId: 'b1gtestfolder0000000000',
+  });
+  assert.equal(queryOf(request).get('folderId'), 'b1gtestfolder0000000000');
+  assert.equal('folderId' in request.body, false, 'the folder is not a body field');
+});
+
+await test('one chunk of the v3 stream is read out of the envelope', () => {
+  const bytes = yandexAudioBytes(JSON.stringify({ audioChunk: { data: YANDEX_ONE_B64 } }));
+  assert.equal(bytes.length, YANDEX_CHUNK_ONE.length);
+  assert.deepEqual(bytes, YANDEX_CHUNK_ONE);
+});
+
+await test('the older v2 envelope is read out too', () => {
+  const bytes = yandexAudioBytes(JSON.stringify({ result: { audioChunk: { data: YANDEX_ONE_B64 } } }));
+  assert.equal(bytes.length, YANDEX_CHUNK_ONE.length);
+  assert.deepEqual(bytes, YANDEX_CHUNK_ONE);
+});
+
+await test('a stream that arrives as an array is concatenated in order', () => {
+  const body = JSON.stringify([
+    { audioChunk: { data: YANDEX_ONE_B64 } },
+    { audioChunk: { data: YANDEX_TWO_B64 } },
+  ]);
+  const bytes = yandexAudioBytes(body);
+  assert.equal(bytes.length, YANDEX_CHUNK_ONE.length + YANDEX_CHUNK_TWO.length);
+  assert.deepEqual(bytes, Buffer.concat([YANDEX_CHUNK_ONE, YANDEX_CHUNK_TWO]));
+});
+
+await test('a stream that arrives as NDJSON is concatenated in order', () => {
+  const body = `${JSON.stringify({ audioChunk: { data: YANDEX_ONE_B64 } })}\n${JSON.stringify({ audioChunk: { data: YANDEX_TWO_B64 } })}\n`;
+  const bytes = yandexAudioBytes(body);
+  assert.equal(bytes.length, YANDEX_CHUNK_ONE.length + YANDEX_CHUNK_TWO.length);
+  assert.deepEqual(bytes, Buffer.concat([YANDEX_CHUNK_ONE, YANDEX_CHUNK_TWO]));
+});
+
+await test('a chunk that carries its type is read out', () => {
+  const body = JSON.stringify({ audioChunk: { data: YANDEX_ONE_B64 }, chunkType: 'AUDIO' });
+  const bytes = yandexAudioBytes(body);
+  assert.equal(bytes.length, YANDEX_CHUNK_ONE.length);
+  assert.deepEqual(bytes, YANDEX_CHUNK_ONE);
+});
+
+await test('the bytes of the AudioContent shape are read out as well', () => {
+  const bytes = yandexAudioBytes(JSON.stringify({ result: { content: YANDEX_ONE_B64 } }));
+  assert.equal(bytes.length, YANDEX_CHUNK_ONE.length);
+  assert.deepEqual(bytes, YANDEX_CHUNK_ONE);
+});
+
+await test('an answer without audio is an error, not an empty file', () => {
+  assert.throws(() => yandexAudioBytes('{"result":{}}'), /without audio/);
+  assert.throws(() => yandexAudioBytes('{"audioChunk":{"data":""}}'), /without audio/);
+  assert.throws(() => yandexAudioBytes('not json at all'), /not JSON/);
+  assert.throws(() => yandexAudioBytes(''), /empty body/);
+});
+
+await test('the service sends the v3 body to the route of the service', async () => {
+  const audio = Buffer.from('ID3yandex-v3'.padEnd(2048, '.'));
+  const fetchImpl = recordingFetch(async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ audioChunk: { data: audio.toString('base64') } }),
+  }));
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+6%',
+      pitch: '+12Hz',
+      volume: '+0%',
+      ttsProvider: 'yandex',
+      yandexApiKey: YANDEX_KEY,
+      yandexVoice: 'marina',
+    }),
+  });
+
+  const result = await service.ensure('Проверка тела v3.');
+  assert.equal(fetchImpl.calls.length, 1, 'the service must be asked exactly once');
+  const call = fetchImpl.calls[0];
+  assert.ok(call.url.includes('/tts/v3/utteranceSynthesis'), call.url);
+  assert.ok(Array.isArray(call.body.hints), 'hints must be an array on the wire too');
+  assert.equal(call.body.hints[0].voice, 'marina');
+  assert.equal(call.body.hints[0].speed, 1.06);
+  assert.equal(call.body.outputAudioSpec.containerAudio.containerAudioType, 'MP3');
+  assert.equal(call.headers.Authorization, `Api-Key ${YANDEX_KEY}`);
+  assert.deepEqual(await readFile(result.file), audio);
+});
+
+await test('a 403 answer says that the key has no rights on the folder', async () => {
+  const fetchImpl = recordingFetch(async () => ({
+    ok: false,
+    status: 403,
+    text: async () =>
+      JSON.stringify({ code: 16, message: `PermissionDenied: key ${YANDEX_KEY} has no rights on the folder` }),
+  }));
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+0%',
+      pitch: '+0Hz',
+      volume: '+0%',
+      ttsProvider: 'yandex',
+      yandexApiKey: YANDEX_KEY,
+      yandexVoice: 'marina',
+    }),
+  });
+
+  await assert.rejects(
+    () => service.ensure('Проверка прав на папку.'),
+    (error) => {
+      const message = String(error?.message ?? error);
+      assert.match(message, /не имеет прав на папку/, message);
+      assert.match(message, /SpeechKit/, message);
+      assert.ok(!message.includes(YANDEX_KEY), `the key must never reach an error message: ${message}`);
+      return true;
+    },
+  );
+});
+
+await test('a 400 answer shows the message of the service itself', async () => {
+  const fetchImpl = recordingFetch(async () => ({
+    ok: false,
+    status: 400,
+    text: async () =>
+      JSON.stringify({
+        code: 3,
+        message: 'cannot unmarshal object into Go value of type []json.RawMessage',
+      }),
+  }));
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+0%',
+      pitch: '+0Hz',
+      volume: '+0%',
+      ttsProvider: 'yandex',
+      yandexApiKey: YANDEX_KEY,
+      yandexVoice: 'marina',
+    }),
+  });
+
+  await assert.rejects(
+    () => service.ensure('Проверка формы тела.'),
+    (error) => {
+      const message = String(error?.message ?? error);
+      assert.match(message, /cannot unmarshal object into Go value/, message);
+      assert.ok(!message.includes(YANDEX_KEY), `the key must never reach an error message: ${message}`);
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+await test('the Google provider sends the v1 body to the documented route', async () => {
+  const audio = Buffer.from('ID3google-v1'.padEnd(2048, '.'));
+  const fetchImpl = recordingFetch(async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ audioContent: audio.toString('base64') }),
+  }));
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+6%',
+      pitch: '+12Hz',
+      volume: '+0%',
+      ttsProvider: 'google',
+      googleApiKey: 'AIza-test-key',
+      googleVoice: 'ru-RU-Wavenet-B',
+    }),
+  });
+
+  const result = await service.ensure('Проверка тела Google.');
+  assert.equal(fetchImpl.calls.length, 1, 'the service must be asked exactly once');
+  const call = fetchImpl.calls[0];
+  assert.ok(call.url.includes('/v1/text:synthesize'), call.url);
+  assert.ok(call.url.includes('key=AIza-test-key'), 'the key rides in the query, as the service documents');
+  assert.equal(call.body.input.text, 'Проверка тела Google.');
+  assert.equal(call.body.voice.languageCode, 'ru-RU');
+  assert.equal(call.body.voice.name, 'ru-RU-Wavenet-B');
+  assert.equal(call.body.audioConfig.audioEncoding, 'MP3');
+  assert.equal(call.body.audioConfig.speakingRate, 1.06);
+  assert.deepEqual(await readFile(result.file), audio);
+});
+
+await test('a Google key failure names the key and the API, and never echoes the secret', async () => {
+  const fetchImpl = recordingFetch(async () => ({
+    ok: false,
+    status: 403,
+    text: async () => JSON.stringify({ error: { message: 'Text-to-Speech API has not been used in project' } }),
+  }));
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+0%',
+      pitch: '+0Hz',
+      volume: '+0%',
+      ttsProvider: 'google',
+      googleApiKey: 'AIza-secret',
+      googleVoice: 'ru-RU-Wavenet-A',
+    }),
+  });
+
+  await assert.rejects(
+    () => service.ensure('Проверка ключа Google.'),
+    (error) => {
+      const message = String(error?.message ?? error);
+      assert.match(message, /Text-to-Speech/, message);
+      assert.ok(!message.includes('AIza-secret'), `the key must never reach an error message: ${message}`);
+      return true;
+    },
+  );
+});
+
+await test('a Google answer without audio is an error, not silence', () => {
+  assert.throws(() => googleAudioBytes(JSON.stringify({})), /without audio/);
+  assert.throws(() => googleAudioBytes(''), /empty body/);
+  assert.throws(() => googleAudioBytes('not json'), /not JSON/);
+});
+
+await test('the tone and the volume are read against the documented reference', () => {
+  // +12 Hz on a nominal 200 Hz voice: 12 * log2(1 + 12/200) ≈ 1.01 semitones.
+  assert.equal(googlePitchSemitones('+12Hz'), 1.01);
+  assert.equal(googlePitchSemitones('+0Hz'), 0);
+  assert.equal(googlePitchSemitones(''), null);
+  // +10% of amplitude: 20 * log10(1.1) ≈ 0.83 dB.
+  assert.equal(googleVolumeDb('+10%'), 0.83);
+  assert.equal(googleVolumeDb('+0%'), 0);
+  assert.equal(googleVolumeDb(''), null);
+});
+
+// ---------------------------------------------------------------------------
+await test('the free Google route asks for small pieces, cut on word boundaries', () => {
+  const long = 'слово '.repeat(60);
+  const pieces = googleFreePieces(long);
+  assert.ok(pieces.length > 1, 'a long text must be cut');
+  for (const piece of pieces) {
+    assert.ok(piece.length <= 200, `a piece must fit the route: ${piece.length}`);
+    assert.ok(!piece.startsWith(' '), 'a piece must not start with a space');
+  }
+  assert.equal(
+    pieces.join(' ').replace(/\s+/g, ' ').trim(),
+    long.replace(/\s+/g, ' ').trim(),
+    'the pieces must carry the whole text, in order',
+  );
+  assert.deepEqual(googleFreePieces(''), []);
+  assert.deepEqual(googleFreePieces('    '), []);
+});
+
+await test('the free Google URL is the page route with the text in it', () => {
+  const url = googleFreeUrl('Привет, Ви.');
+  assert.ok(url.includes('translate.google.com/translate_tts'), url);
+  assert.ok(url.includes('tl=ru'), url);
+  assert.ok(url.includes('client=tw-ob'), url);
+  assert.ok(url.includes('q=%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82'), url);
+});
+
+await test('the free Google route speaks without a key', async () => {
+  const audio = Buffer.from('ID3google-free'.padEnd(1024, '.'));
+  const fetchImpl = recordingFetch(async () => audioAnswer(audio));
+  const service = createSynthService({
+    binPath: DEFAULT_EDGE_TTS_BIN,
+    cacheDir: customCacheDir,
+    timeoutMs: 10000,
+    fetchImpl,
+    voiceOptions: () => ({
+      voice: 'ru-RU-SvetlanaNeural',
+      rate: '+6%',
+      pitch: '+0Hz',
+      volume: '+0%',
+      ttsProvider: 'google-free',
+    }),
+  });
+
+  const result = await service.ensure('Проверка бесплатного гугла.');
+  assert.equal(fetchImpl.calls.length, 1, 'the route must be asked exactly once for a short text');
+  assert.ok(fetchImpl.calls[0].url.includes('tl=ru'));
+  assert.deepEqual(await readFile(result.file), audio);
+});
 
 // ---------------------------------------------------------------------------
 await rm(cacheDir, { recursive: true, force: true }).catch(() => {});
