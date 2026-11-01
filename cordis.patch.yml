@@ -68,9 +68,10 @@
 # The card renders exactly the fields the row's `Config` schema declares — the
 # user-owned set in SETTINGS_FIELDS (lib/config.js: preset / rate / pitch /
 # voice / stripCode / autoPreset / dictionary / userPresets / spectrum /
-# ttsProvider / customBaseUrl / customApiKey / customModel). Deployment-only
-# keys are declared outside that schema, so they stay composition state rather
-# than becoming editable.
+# ttsProvider / customBaseUrl / customApiKey / customModel / yandexApiKey /
+# yandexVoice / googleApiKey / googleVoice / yoMode / uiLanguage).
+# Deployment-only keys are declared outside that schema, so they stay
+# composition state rather than becoming editable.
 - insert:
     - id: dsh-voice-v
       name: 'dsh-voice-v'

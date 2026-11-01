@@ -1,6 +1,6 @@
 {
   "name": "dsh-voice-v",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Read-aloud speaker button under every assistant message in the DeepSeek Harness web GUI, voiced by edge-tts: seven Russian and multilingual voices, the Yandex SpeechKit voices, the narration preset picked from the tone of the message, and a spectrum inside the button while the voice plays. Ships a configuration card on the plugin's own page and in the Plugins tab (presets, user presets, live sliders, pronunciation dictionary, code-stripping switch, the letter ё, the synthesis provider) projected from the plugin row's own schemastery Config.",
   "author": "ZEROTOOL",
   "license": "MIT",

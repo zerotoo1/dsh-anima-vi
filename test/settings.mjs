@@ -40,11 +40,13 @@ import {
   SETTINGS_NAMESPACE,
   SPECTRUM_VARIANTS,
   TTS_PROVIDERS,
+  UI_LANGUAGES,
   buildSettingsSchema,
   clampToRange,
   describePresets,
   describeVoices,
   normalizeTtsProvider,
+  normalizeUiLanguage,
   parsePitchHz,
   parseRatePct,
   pickSettingsBase,
@@ -615,6 +617,7 @@ await test('the user section may only shadow the fields the namespace owns', () 
     'googleApiKey',
     'googleVoice',
     'yoMode',
+    'uiLanguage',
   ]);
 });
 
@@ -1837,7 +1840,50 @@ await test('GET /config reports the preset table, the defaults, and the domains'
   assert.equal(payload.dictionary.redscript, DEFAULT_PRONUNCIATION.redscript);
   assert.equal(payload.dictionaryDefaults.redscript, DEFAULT_PRONUNCIATION.redscript);
   assert.equal(payload.defaultPreviewText, DEFAULT_PREVIEW_TEXT);
+  assert.equal(payload.uiLanguage, 'ru', 'the card speaks Russian until the user says otherwise');
+  assert.deepEqual(
+    payload.uiLanguages,
+    [
+      { id: 'ru', label: 'Русский', labelEn: 'Russian' },
+      { id: 'en', label: 'English', labelEn: 'English' },
+    ],
+    'the card is offered both languages and each name in both',
+  );
   assert.equal(payload.settingsRegistered, false, 'no liveSettings probe was supplied');
+});
+
+await test('the interface language is a setting of its own, and it normalizes', async () => {
+  assert.deepEqual(UI_LANGUAGES.map((entry) => entry.id), ['ru', 'en']);
+  assert.equal(normalizeUiLanguage(undefined), 'ru', 'nothing said means Russian');
+  assert.equal(normalizeUiLanguage(''), 'ru');
+  assert.equal(normalizeUiLanguage('klingon'), 'ru', 'a language the card does not speak falls back');
+  assert.equal(normalizeUiLanguage('en'), 'en');
+  assert.equal(normalizeUiLanguage('EN'), 'en', 'the case does not matter');
+  assert.equal(normalizeUiLanguage('en-US'), 'en', 'a region tag is read by its language');
+  assert.equal(normalizeUiLanguage('ru-RU'), 'ru');
+
+  const settings = resolveVoiceConfig({ uiLanguage: 'en' });
+  assert.equal(settings.uiLanguage, 'en', 'the resolved configuration carries the language');
+  assert.equal(resolveVoiceConfig({}).uiLanguage, 'ru', 'the default stays Russian');
+
+  const built = buildSettingsSchema(fakeSchemaFactory());
+  assert.ok(built.dict.uiLanguage !== undefined, 'the namespace schema declares the language');
+  assert.equal(built.dict.uiLanguage.meta.default, 'ru', 'Russian is the schema default too');
+
+  const synth = makeSynth(() => ({ voice: DEFAULT_VOICE, rate: '+6%', pitch: '+12Hz', volume: '+0%' }));
+  const routes = createVoiceHandler({
+    ctx: { get: () => undefined, logger: { warn: () => {} } },
+    liveSettings: () => resolveVoiceConfig({ uiLanguage: 'en' }),
+    synth,
+  });
+  const res = await callRoute(routes, { method: 'GET', url: '/dsh-voice-v/config' });
+  assert.equal(res.json().uiLanguage, 'en', 'the host reports the language it resolved');
+
+  const speak = await callRoute(routes, {
+    method: 'GET',
+    url: '/dsh-voice-v/speak?text=' + encodeURIComponent('Привет'),
+  });
+  assert.equal(speak.json().uiLanguage, 'en', 'the narration manifest carries the language too');
 });
 
 await test('GET /config reports the voice catalogue the card renders', async () => {
@@ -3051,6 +3097,8 @@ function configPayload(settings, extra = {}) {
     dictionaryDefaults: DEFAULT_PRONUNCIATION,
     defaultPreviewText: DEFAULT_PREVIEW_TEXT,
     ttsProviders: TTS_PROVIDERS,
+    uiLanguage: settings.uiLanguage,
+    uiLanguages: UI_LANGUAGES,
     settingsRegistered: true,
     ...extra,
   };
@@ -3475,6 +3523,7 @@ await test('the card still exposes every setting it owned before', async () => {
     'googleApiKey',
     'googleVoice',
     'yoMode',
+    'uiLanguage',
   ]);
 
   const mini = createMiniReact();
@@ -4830,6 +4879,62 @@ await test('the spectrum variant draws the wide bars over the composer, not in t
   assert.equal(only.phase(), 'idle');
   await strip.rerender();
   assert.equal(oscilloStripOf(strip.tree), undefined, 'the spectrum must go when the voice stops');
+});
+
+await test('the card speaks English when the host says so, and a switch flips every label', async () => {
+  const mini = createMiniReact();
+  const settings = resolveVoiceConfig({ uiLanguage: 'en' });
+  const stubFetch = async () => ({ ok: true, json: async () => configPayload(settings) });
+  const component = loadCardComponent(mini.react, { fetch: stubFetch });
+  const writes = [];
+  const scope = recordingScope(
+    {
+      status: 'ready',
+      value: { ...settings },
+      base: {},
+      user: {},
+      revision: 30,
+      writable: true,
+      mode: 'host',
+    },
+    writes,
+  );
+
+  const mounted = await mountCard(component, { scope }, mini);
+  const text = textOf(mounted.tree).replace(/\s+/gu, ' ');
+  assert.ok(text.includes('Read aloud (dsh-voice-v)'), 'the title must be English');
+  assert.ok(text.includes('Pronunciation dictionary'), 'the blocks must be English');
+  assert.ok(text.includes('Interface language'), 'the language block must name itself');
+  assert.equal(text.includes('Озвучка ответов'), false, 'the Russian title must be gone');
+  const tempo = elementsOf(mounted.tree).find((node) => node.props['aria-label'] === 'Tempo in percent');
+  assert.ok(tempo !== undefined, 'the aria-labels follow the language too');
+  // Host-reported data is not translated: a voice id is an id.
+  const voice = elementsOf(mounted.tree).find(
+    (node) => node.type === 'option' && node.props.value === 'ru-RU-SvetlanaNeural',
+  );
+  assert.ok(voice !== undefined, 'the catalogue still offers the voice by its id');
+  assert.ok(String(textOf(voice)).includes('ru-RU-SvetlanaNeural'), 'the id stays exactly as the host reported it');
+
+  // The switch is staged like any other field, and the card speaks the staged
+  // choice at once — before Save.
+  const language = elementsOf(mounted.tree).find(
+    (node) =>
+      node.type === 'select' &&
+      elementsOf(node).some((option) => option.type === 'option' && option.props.value === 'ru'),
+  );
+  assert.ok(language !== undefined, 'the card must offer the language as a dropdown');
+  assert.equal(language.props.value, 'en', 'the dropdown shows the language in force');
+
+  language.props.onChange({ target: { value: 'ru' } });
+  const back = textOf(await mounted.rerender()).replace(/\s+/gu, ' ');
+  assert.ok(back.includes('Озвучка ответов (dsh-voice-v)'), 'the card speaks Russian the moment it is chosen');
+
+  const save = elementsOf(mounted.tree).find(
+    (node) => node.type === 'button' && textOf(node) === 'Сохранить' && node.props.disabled === false,
+  );
+  assert.ok(save !== undefined, 'Save must be armed by the language alone');
+  await save.props.onClick();
+  assert.deepEqual(writes, [['set', 'uiLanguage', 'ru']], 'one write, carrying the language');
 });
 
 console.log('');

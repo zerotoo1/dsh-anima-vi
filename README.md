@@ -90,6 +90,15 @@ this table spell the same string.
 
 Settings → Plugins → **Plugin configuration** → *Озвучка ответов (dsh-voice-v)*.
 
+* **Язык интерфейса / Interface language** — the card itself is bilingual. The
+  dropdown offers `Русский` and `English`, the value is the `uiLanguage`
+  setting (`ru` by default), and switching it re-labels the whole card, the
+  speaker buttons under the messages and their tooltips at once — no reload.
+  The choice is **staged like every other field**: the card speaks the staged
+  language immediately, and *Сохранить* writes it, while *Отменить правки*
+  brings back the host's. The narration is untouched: the voice reads the
+  answer, not the interface. Host data is never translated — a voice id stays
+  `ru-RU-SvetlanaNeural` in both languages.
 * **Presets** — five shipped ones, as data (`lib/config.js`), rendered from
   whatever the host reports on `GET /dsh-voice-v/config`:
 
@@ -783,6 +792,20 @@ node test/synth.mjs
 ```
 
 ## Changelog
+
+### 0.4.0
+
+- **The interface is bilingual.** The card speaks Russian and English, and the
+  language is a setting of its own (`uiLanguage`, `ru` by default), so both
+  halves agree on it: the Host resolves it and reports it on `/config`, `/speak`
+  and `/health`, and the card translates itself from one dictionary. A switch
+  re-labels the card, the speaker buttons and their tooltips immediately, before
+  Save. Host data — voice ids, provider names, a user's own preset label — is
+  never translated.
+- **`test/settings.mjs` covers the language**: normalization, the schema
+  default, the resolver, the `/config` and `/speak` payloads, the English card,
+  and the switch staging exactly one `uiLanguage` write while Russian stays
+  byte-for-byte what it was.
 
 ### 0.3.0
 
